@@ -1,12 +1,14 @@
-# NitroClash local 4v4 prototype
+# NitroClash hosted 4v4
 
-Current userscript version: **3.2.0**
+Current userscript version: **3.4.0**
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
 During a goal replay, a left click/boost press votes to skip. The replay ends early once every currently connected player has voted. If everyone leaves an arena, that match is discarded; the next player starts a fresh match with a new 3-2-1-GO kickoff.
 
 Stock party links and the **Private game** checkbox now route matches by their six-character party code. Each code owns an isolated arena, the displayed Team 1/Team 2 choice is preserved when the player name identifies one side, and private disconnects reserve that exact slot for 60 seconds. Public matchmaking never enters a private arena.
+
+In-game text and quick chat are relayed only to players in the same arena, with length and rate limits. At the results screen, **Change Team** leaves the ended match and enters an available non-full match; if none exists, the server creates a fresh arena and starts its kickoff.
 
 The closed browser client has hard-coded layouts for 1v1, 2v2, 3v3 and 5v5. The prototype uses its 5v5 layout while hiding one unused slot on each team. The server therefore has eight visible player positions without requiring the original source code.
 
@@ -29,34 +31,33 @@ Point values match the game's action protocol:
 
 First touch and goal bonuses are exact state events. Shot and save awards use trajectory and pitch-zone checks reconstructed on the local server; the original server's unpublished distance/cooldown thresholds are not present in the browser code. Centre-ball and clear-ball awards are intentionally disabled.
 
-The results screen now advertises a replay. **Download Replay** asks this local server for the match and saves a standard `.ncr` file containing 5v5-layout frames, the eight visible player names, scoring actions, goals, overtime and victory events. No replay data is requested from the official or third-party server.
+The results screen now advertises a replay. **Download Replay** asks this server for the match and saves a standard `.ncr` file containing 5v5-layout frames, the eight visible player names, scoring actions, goals, overtime and victory events. No replay data is requested from the official or third-party server.
 
 Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Blue and red always receive exact mirrored counterparts, while the overall selection does not have to be vertically symmetrical.
 
-## Run it
+## Join the hosted server
 
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
-2. In Tampermonkey, create a new script and replace its contents with `nitroclash-local-4v4.user.js`, then save it.
-3. Double-click `start-server.cmd`. Leave the terminal window open. Other players on the same development server must each use a separate browser tab/window with the v3 script.
-4. Reload `https://nitroclash.io`.
-5. Confirm that the orange **LOCAL 4v4** badge appears.
-6. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
+2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
+3. Reload `https://nitroclash.io`.
+4. Confirm that the orange **HOSTED 4v4 v3.4** badge appears.
+5. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
 
-For a local multiplayer check, open NitroClash independently in a second tab or browser window with the same v3 userscript, choose 4v4 and press Play. The terminal should show both names entering the same arena with different slot numbers. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
+For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
 
-For a private test, create a party using NitroClash's normal **Create party** button, share its `#XXXXXX` link, arrange Team 1/Team 2, choose 4v4, tick **Private game**, and start normally. Terminal join messages should name the private party code. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
+For a private test, create a party using NitroClash's normal **Create party** button, share its `#XXXXXX` link, arrange Team 1/Team 2, choose 4v4, tick **Private game**, and start normally. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
 
-The userscript answers NitroClash's server-list and reservation requests with native in-page blob responses, then redirects the resulting game socket to your own computer. Joining therefore no longer depends on NitroClash's public server-list/matchmaking endpoint and does not require a cross-origin localhost HTTP request. Other unrelated website requests are left alone.
+The userscript answers NitroClash's server-list and reservation requests with native in-page blob responses, then redirects the resulting game socket to `wss://fourv4-s2fb.onrender.com`. Joining therefore no longer depends on NitroClash's public game matchmaking endpoint. Other unrelated website requests are left alone.
 
 ## Current limitations
 
-- Up to eight real browser connections now share each public arena and receive unique player slots. This is still local development: the userscript points to `127.0.0.1` until the Render deployment step.
+- Up to eight real browser connections share each public arena and receive unique player slots. Full arenas cause the server to create another isolated match automatically.
 - Player acceleration, boost, braking, arena walls, player collisions and ball collisions now use Planck with the constants exposed by NitroClash's browser client.
 - Public slot allocation and one-minute reconnect identity are implemented. A public slot is released immediately; reconnect restores the original slot if free, otherwise prefers a free slot on the same team, and is refused when the previous match is full.
-- Private party routing and one-minute private slot reservation are implemented through the stock party interface. Post-game rematches/team changes and the Render deployment configuration are still future stages.
+- Private party routing and one-minute private slot reservation are implemented through the stock party interface. **Change Team** matchmaking is implemented; coordinated same-team rematches are still a future stage.
 - The closed client still allocates ten compatibility slots internally. The userscript follows the trainer's display-tree technique: it finds only player sprites whose live physics position is deliberately outside the map and hides those sprites plus their paired markers at render time. The spare server bodies do not exist, while all real-player off-screen arrows stay enabled.
-- This version is for local protocol testing only.
+- Render's free service can sleep after an idle period, so the first connection after inactivity can take longer while the server wakes.
 
-## Stop it
+## Return to normal NitroClash
 
-Close the server terminal window or press `Ctrl+C` in it. Disable the local userscript to return NitroClash to its normal servers.
+Disable the hosted userscript to return NitroClash to its normal servers.

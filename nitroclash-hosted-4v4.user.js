@@ -1,8 +1,11 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.3.1
+// @version      3.4.0
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
+// @homepageURL  https://github.com/lemonelemone/4v4
+// @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
+// @downloadURL  https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
 // @match        *://nitroclash.io/*
 // @match        *://www.nitroclash.io/*
 // @grant        unsafeWindow
@@ -15,6 +18,33 @@
   const NativeWebSocket = win.WebSocket;
   const NativeXMLHttpRequest = win.XMLHttpRequest;
   const gameServerUrl = "wss://fourv4-s2fb.onrender.com";
+  const gameServerHttpUrl = gameServerUrl.replace(/^wss:/i, "https:");
+  const gameServerReady = new Promise((resolve) => {
+    const startedAt = Date.now();
+    const probe = () => {
+      const request = new NativeXMLHttpRequest();
+      const retry = () => {
+        if (Date.now() - startedAt >= 90000) {
+          console.warn("[nc-local-4v4] hosted server wake-up timed out; allowing NitroClash to retry");
+          resolve(false);
+        } else {
+          setTimeout(probe, 1500);
+        }
+      };
+      request.open("GET", `${gameServerHttpUrl}/health?wake=${Date.now()}`, true);
+      request.timeout = 15000;
+      request.onload = () => {
+        if (request.status >= 200 && request.status < 400) {
+          console.log("[nc-local-4v4] hosted server is awake");
+          resolve(true);
+        } else retry();
+      };
+      request.onerror = retry;
+      request.ontimeout = retry;
+      request.send(null);
+    };
+    probe();
+  });
   const reservationStorageName = "nc4v4-tab-reservation-key";
   function createReservationKey() {
     const random = new Uint32Array(1);
@@ -126,7 +156,10 @@
         this._emit("loadend");
         console.log(`[nc-local-4v4] supplied local ${this._fake.kind} response`);
       };
-      if (this._fake.async) setTimeout(finish, 0); else finish();
+      if (this._fake.kind === "servers") {
+        gameServerReady.then(finish, finish);
+      } else if (this._fake.async) setTimeout(finish, 0);
+      else finish();
     }
     abort() {
       if (!this._fake) return this._native.abort();
@@ -199,7 +232,11 @@
     } catch (_) {}
     return nativeXhrOpen.call(this, finalMethod, finalUrl, ...rest);
   };
-  win.XMLHttpRequest = NativeXMLHttpRequest;
+  // Keep the wrapper installed so the server-list response can wait for a
+  // sleeping free Render instance to wake before NitroClash opens its one-shot
+  // latency socket. The native prototype redirect above remains as a fallback
+  // for any library that cached the browser constructor before this script ran.
+  win.XMLHttpRequest = LocalXMLHttpRequest;
   function currentPrivatePartyRoute() {
     const partyCode = String(win.location.hash || "").replace(/^#/, "").toUpperCase();
     const privateGame = document.getElementById("private-game")?.checked === true;
@@ -361,7 +398,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.3.1";
+    badge.textContent = "HOSTED 4v4 v3.4";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

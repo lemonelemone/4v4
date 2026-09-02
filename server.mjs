@@ -352,6 +352,15 @@ function namePacket(slot, name) {
   return buffer;
 }
 
+function chatPacket(slot, message) {
+  const text = String(message || "").slice(0, 255);
+  const buffer = Buffer.alloc(3 + text.length * 2);
+  buffer[0] = 13;
+  buffer[1] = slot;
+  putString(buffer, 2, text);
+  return buffer;
+}
+
 function liveStatsPacket(world, connectedSlots = new Set([0])) {
   const buffer = Buffer.alloc(1 + CLIENT_SLOTS * 8);
   buffer[0] = 18;
@@ -1106,6 +1115,53 @@ function assignPrivateConnection(connection) {
   return { arena, slot, reconnect };
 }
 
+function sendArenaEntry(connection, arena) {
+  connection.send(controlPacket(arena.world, connection.slot, connection.username));
+  connection.send(Buffer.from([11, 8, 0]));
+  connection.send(Buffer.from([11, 9, 0]));
+  if (!arena.started) {
+    startArena(arena);
+  } else {
+    const countdown = Math.max(0, arena.startsAt - Date.now());
+    connection.send(startPacket(arena.world, countdown));
+    connection.send(arenaStatsPacket(arena));
+    connection.send(statePacket(arena.world));
+  }
+}
+
+function changeConnectionMatch(connection) {
+  const previousArena = connection.arena;
+  const previousSlot = connection.slot;
+  if (!connection.ready || !previousArena || previousSlot === null || previousArena.phase !== "ended")
+    return false;
+
+  if (previousArena.connections.get(previousSlot) === connection)
+    previousArena.connections.delete(previousSlot);
+  previousArena.replaySkipVotes.delete(connection);
+  parkSlot(previousArena, previousSlot);
+  arenaSend(previousArena, namePacket(previousSlot, ""));
+
+  connection.arena = null;
+  connection.slot = null;
+  connection.pendingInput = null;
+  connection.lastInputFlags = 0;
+  connection.resuming = false;
+
+  const assignment = connection.kind === "private"
+    ? assignPrivateConnection(connection)
+    : assignPublicConnection(connection);
+  if (assignment.error) {
+    console.error(`Could not change match for ${connection.username}: ${assignment.error}`);
+    return false;
+  }
+
+  if (previousArena.connections.size === 0 && previousArena.reservedSlots.size === 0)
+    retireEmptyArena(previousArena);
+  sendArenaEntry(connection, assignment.arena);
+  console.log(`Change team ${connection.username}: arena ${previousArena.id} → ${assignment.arena.id}, slot ${assignment.slot + 1}`);
+  return true;
+}
+
 function createUnusedReservationKey() {
   let key;
   do key = crypto.randomInt(1, 0x80000000);
@@ -1140,6 +1196,7 @@ function installSharedUpgradeHandler(serverInstance) {
       cleaned: false,
       pendingInput: null,
       lastInputFlags: 0,
+      lastChatAt: 0,
       resuming: false,
       kind: privateParty ? "private" : "public",
       partyCode: privateParty ? requestedParty : null,
@@ -1195,20 +1252,24 @@ function installSharedUpgradeHandler(serverInstance) {
             if (!connection.joined || connection.ready) break;
             connection.ready = true;
             const arena = connection.arena;
-            connection.send(controlPacket(arena.world, connection.slot, connection.username));
-            connection.send(Buffer.from([11, 8, 0]));
-            connection.send(Buffer.from([11, 9, 0]));
-            if (!arena.started) {
-              startArena(arena);
-            } else {
-              const countdown = Math.max(0, arena.startsAt - Date.now());
-              connection.send(startPacket(arena.world, countdown));
-              connection.send(arenaStatsPacket(arena));
-              connection.send(statePacket(arena.world));
-            }
+            sendArenaEntry(connection, arena);
             connection.resuming = false;
             break;
           }
+          case 4: {
+            if (!connection.ready || !connection.arena || connection.slot === null) break;
+            const now = Date.now();
+            if (now - connection.lastChatAt < 350) break;
+            const decoded = readString(packet, 1).value;
+            const message = decoded.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 255);
+            if (!message) break;
+            connection.lastChatAt = now;
+            arenaSend(connection.arena, chatPacket(connection.slot, message));
+            break;
+          }
+          case 5:
+            if (packet.length >= 2 && packet[1] === 1) changeConnectionMatch(connection);
+            break;
           case 8: {
             if (!connection.ready) break;
             try {
@@ -1302,6 +1363,7 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
     phase: "playing", phaseTicks: 0, history: [], replayFrames: [], replayIndex: 0,
     fullReplayFrames: [], lastReplayTurn: -1, cachedReplay: null,
     reservationKey: 0, resuming: false,
+    lastChatAt: 0,
   };
   const send = (payload, opcode = 2) => socket.writable && socket.write(wsFrame(payload, opcode));
   const saveReplayFrame = (snapshot) => {
@@ -1520,6 +1582,16 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
           console.log(connection.resuming ? "Local 4v4 arena resumed" : "Local 4v4 arena started");
           connection.resuming = false;
           break;
+        case 4: {
+          const now = Date.now();
+          if (!connection.started || now - connection.lastChatAt < 350) break;
+          const decoded = readString(packet, 1).value;
+          const message = decoded.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 255);
+          if (!message) break;
+          connection.lastChatAt = now;
+          send(chatPacket(0, message));
+          break;
+        }
         case 8: {
           if (!connection.started) break;
           try {
@@ -1573,6 +1645,8 @@ export {
   ACTION,
   ACTION_POINTS,
   buildNcrReplay,
+  changeConnectionMatch,
+  chatPacket,
   detectGoal,
   gameOverPacket,
   createArena,
@@ -1581,5 +1655,6 @@ export {
   ncrFrameFromStatePacket,
   recordGoal,
   registerReplaySkipVote,
+  server,
   statePacket,
 };
