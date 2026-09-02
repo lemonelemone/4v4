@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.4.1
+// @version      3.4.3
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -18,12 +18,16 @@
   const NativeWebSocket = win.WebSocket;
   const NativeXMLHttpRequest = win.XMLHttpRequest;
   const gameServerUrl = "wss://fourv4-s2fb.onrender.com";
-  const gameServerHttpUrl = gameServerUrl.replace(/^wss:/i, "https:");
   const gameServerReady = new Promise((resolve) => {
     const startedAt = Date.now();
     const probe = () => {
-      const request = new NativeXMLHttpRequest();
+      let settled = false;
+      let socket;
       const retry = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try { socket?.close(); } catch (_) {}
         if (Date.now() - startedAt >= 90000) {
           console.warn("[nc-local-4v4] hosted server wake-up timed out; allowing NitroClash to retry");
           resolve(false);
@@ -31,17 +35,22 @@
           setTimeout(probe, 1500);
         }
       };
-      request.open("GET", `${gameServerHttpUrl}/health?wake=${Date.now()}`, true);
-      request.timeout = 15000;
-      request.onload = () => {
-        if (request.status >= 200 && request.status < 400) {
-          console.log("[nc-local-4v4] hosted server is awake");
+      const timeout = setTimeout(retry, 15000);
+      try {
+        socket = new NativeWebSocket(`${gameServerUrl}/?wake=${Date.now()}`);
+        socket.onopen = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          console.log("[nc-local-4v4] hosted game socket is awake");
+          try { socket.close(); } catch (_) {}
           resolve(true);
-        } else retry();
-      };
-      request.onerror = retry;
-      request.ontimeout = retry;
-      request.send(null);
+        };
+        socket.onerror = retry;
+        socket.onclose = () => { if (!settled) retry(); };
+      } catch (_) {
+        retry();
+      }
     };
     probe();
   });
@@ -293,6 +302,19 @@
         sprite.renderable = false;
         sprite.__nc4v4UnusedSlot = true;
       };
+      const restoreOccupiedSlot = (player, marker) => {
+        if (player?.__nc4v4UnusedSlot) {
+          player.visible = true;
+          player.renderable = true;
+          delete player.__nc4v4UnusedSlot;
+        }
+        if (marker?.__nc4v4UnusedSlot) {
+          // Marker visibility is camera-controlled by the game. Restore its
+          // ability to render without forcing an on-screen arrow to appear.
+          marker.renderable = true;
+          delete marker.__nc4v4UnusedSlot;
+        }
+      };
       const hideSpareSlots = (stage) => {
         if (!stage) return;
         const queue = [stage];
@@ -308,16 +330,22 @@
             // square and ~1.22 world units wide; the ball is ~2.15.
             const playerSized = typeof child?.width === "number" && typeof child?.height === "number" &&
               Math.abs(child.width - child.height) < 0.1 && child.width < 1.6;
-            if (position && playerSized &&
-                (position.x < -20 || position.x > 120 || position.y < -20 || position.y > 80)) {
-              hideForThisFrame(child);
+            if (position && playerSized) {
+              const outsideArena = position.x < -20 || position.x > 120 || position.y < -20 || position.y > 80;
+              if (outsideArena) {
+                hideForThisFrame(child);
               // The closed client constructs the scene in exact pairs:
               // player[slot], marker[slot], player[slot + 1], marker[slot + 1].
               // Hide the immediate sibling instead of guessing from textures;
               // skins can replace textures and made the old red-marker check
               // unreliable. Only a body-driven player at the impossible spare
               // coordinates reaches this branch, so real-player arrows remain.
-              hideForThisFrame(children[index + 1]);
+                hideForThisFrame(children[index + 1]);
+              } else {
+                // An empty slot can become occupied after this client has
+                // already joined. Undo our old hidden state immediately.
+                restoreOccupiedSlot(child, children[index + 1]);
+              }
             }
             if (child?.children?.length) queue.push(child);
           }
@@ -398,7 +426,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.4.1";
+    badge.textContent = "HOSTED 4v4 v3.4.3";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
