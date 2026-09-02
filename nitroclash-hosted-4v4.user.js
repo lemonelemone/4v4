@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.5.0
+// @version      3.5.3
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -32,10 +32,10 @@
       return session;
     } catch (_) { return null; }
   };
-  const saveReconnectSession = (route) => {
+  const saveReconnectSession = (route, expiresAt = Date.now() + 60000) => {
     try {
       win.localStorage.setItem(reconnectStorageName, JSON.stringify({
-        expiresAt: Date.now() + 60000,
+        expiresAt,
         kind: route ? "private" : "public",
         partyCode: route?.partyCode || null,
         team: route?.team ?? null,
@@ -295,6 +295,14 @@
     const savedReconnect = reconnectRequested ? readReconnectSession() : null;
     const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : currentPrivatePartyRoute()) : null;
     const spectatorSocket = isNitroSocket && spectateRequested;
+    let spectatorFollowPending = false;
+    if (spectatorSocket) {
+      try {
+        const savedCamera = win.localStorage.getItem("cameraFullScreen");
+        spectatorFollowPending = savedCamera === "1" ||
+          (savedCamera === null && win.localStorage.getItem("initialCameraFullScreen") === "1");
+      } catch (_) {}
+    }
     if (privateRoute) {
       const teamQuery = privateRoute.team === null ? "" : `&team=${privateRoute.team}`;
       finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
@@ -306,6 +314,9 @@
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
     if (isNitroSocket) {
       const wasReconnect = reconnectRequested;
+      let playerJoinSent = false;
+      let matchEnded = false;
+      let reconnectRefreshTimer = null;
       reconnectRequested = false;
       spectateRequested = false;
       connectionAttemptActive = true;
@@ -316,18 +327,47 @@
             ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
           // Server ping sockets send opcode 99. Record reconnect eligibility
           // only when the stock client sends a real player join (opcode 1).
-          if (!spectatorSocket && !wasReconnect && bytes?.[0] === 1) saveReconnectSession(privateRoute);
+          if (!spectatorSocket && bytes?.[0] === 1) {
+            playerJoinSent = true;
+            saveReconnectSession(privateRoute);
+            clearInterval(reconnectRefreshTimer);
+            reconnectRefreshTimer = setInterval(() => saveReconnectSession(privateRoute), 15000);
+          }
         } catch (_) {}
         return nativeSend.call(this, data);
       };
       socket.addEventListener("open", () => { connectionAttemptActive = false; });
+      socket.addEventListener("message", ({ data }) => {
+        try {
+          const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) :
+            ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          if (!spectatorSocket && bytes?.[0] === 14) {
+            matchEnded = true;
+            clearInterval(reconnectRefreshTimer);
+            try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
+          }
+          if (spectatorSocket && spectatorFollowPending && bytes?.[0] === 5) {
+            spectatorFollowPending = false;
+            // The stock client has now applied its first live state. Toggle its
+            // saved full-pitch camera to follow the selected real player.
+            setTimeout(() => win.dispatchEvent(new win.KeyboardEvent("keyup", { key: "c", keyCode: 67, which: 67 })), 0);
+          }
+        } catch (_) {}
+      });
       socket.addEventListener("close", (event) => {
+        clearInterval(reconnectRefreshTimer);
         connectionAttemptActive = false;
         const reason = String(event.reason || "");
         if (/Reconnect expired|Match full|Previous match no longer exists|Private match no longer exists/i.test(reason)) {
           try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
         }
         win.__nc4v4LastConnectionMessage = reason;
+        if (!spectatorSocket && playerJoinSent && !matchEnded &&
+            !/Reconnect expired|Match full|Previous match no longer exists|Private match no longer exists/i.test(reason)) {
+          // Eligibility starts when the connection is lost, not when a
+          // potentially five-minute match originally began.
+          saveReconnectSession(privateRoute, Date.now() + 60000);
+        }
         if (spectatorSocket && reason) setTimeout(() => win.alert(reason), 0);
       });
     }
@@ -441,7 +481,9 @@
       button.className = "button";
       button.textContent = "Reconnect";
       button.title = "Try to rejoin your previous 4v4 match within 60 seconds";
-      Object.assign(button.style, { display: "block", margin: "18px auto 0", padding: "10px 24px" });
+      Object.assign(button.style, suffix === "home"
+        ? { display: "inline-block", margin: "10px 0 0 10px", padding: "10px 24px" }
+        : { display: "block", margin: "18px auto 0", padding: "10px 24px" });
       button.addEventListener("click", () => {
         if (connectionAttemptActive || !readReconnectSession()) return;
         reconnectRequested = true;
@@ -461,7 +503,10 @@
           console.warn("[nc-local-4v4] reconnect failed", error);
         }
       });
-      panel.appendChild(button);
+      if (suffix === "home" && document.getElementById("spectate-button"))
+        document.getElementById("spectate-button").insertAdjacentElement("afterend", button);
+      else
+        panel.appendChild(button);
     };
     const relabel = () => {
       const button = document.getElementById("gamemode-4") ||
@@ -477,9 +522,11 @@
       }
       const session = readReconnectSession();
       installReconnectButton(document.getElementById("connection-lost"), "lost");
-      installReconnectButton(document.getElementById("homepage-content"), "home");
+      installReconnectButton(document.getElementById("homepage-loaded"), "home");
       for (const reconnectButton of document.querySelectorAll('[id^="nc-local-4v4-reconnect-"]')) {
-        reconnectButton.style.display = session ? "block" : "none";
+        reconnectButton.style.display = session
+          ? (reconnectButton.id.endsWith("-home") ? "inline-block" : "block")
+          : "none";
         if (!connectionAttemptActive && reconnectButton.textContent === "Reconnecting...") {
           reconnectButton.disabled = false;
           reconnectButton.textContent = win.__nc4v4LastConnectionMessage || "Reconnect";
@@ -497,13 +544,20 @@
           win.nitroclash.clickSpectate = wrappedSpectate;
         }
       }
+      const badge = document.getElementById("nc-local-4v4-badge");
+      const homepage = document.getElementById("homepage");
+      if (badge && homepage) {
+        const homepageVisible = homepage.style.display !== "none" &&
+          (!win.getComputedStyle || win.getComputedStyle(homepage).display !== "none");
+        badge.style.display = homepageVisible ? "block" : "none";
+      }
     };
     relabel();
     if (!win.__nc4v4RelabelTimer) win.__nc4v4RelabelTimer = setInterval(relabel, 500);
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.5.0";
+    badge.textContent = "HOSTED 4v4 v3.5.3";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

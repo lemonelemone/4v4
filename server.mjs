@@ -245,7 +245,9 @@ function mapPacket() {
 }
 
 function controlPacket(world, controlledSlot, username) {
-  world.players[controlledSlot].name = username || "Player";
+  // A player entry supplies its username. Spectator control packets pass null
+  // so choosing a camera target never overwrites that real player's name.
+  if (username !== null) world.players[controlledSlot].name = username || "Player";
   const namesLength = world.players.reduce((sum, player) => sum + 1 + player.name.length * 2, 0);
   const buffer = Buffer.alloc(15 + CLIENT_SLOTS * 29 + 24 + namesLength + BOOSTS.length / 2);
   buffer[0] = 7;
@@ -794,10 +796,14 @@ function arenaSend(arena, payload, opcode = 2) {
 }
 
 function getSpectatorArena() {
+  return spectatorArenas()[0] || null;
+}
+
+function spectatorArenas() {
   return [...arenas.values()]
     .filter((arena) => arena.kind === "public" && arena.phase !== "ended" &&
       arena.phase !== "retired" && arena.connections.size > 0)
-    .sort((left, right) => right.connections.size - left.connections.size || left.id - right.id)[0] || null;
+    .sort((left, right) => right.connections.size - left.connections.size || left.id - right.id);
 }
 
 function arenaStatsPacket(arena) {
@@ -1175,13 +1181,28 @@ function sendArenaEntry(connection, arena) {
 
 function sendSpectatorEntry(connection, arena) {
   const focusSlot = [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
-  connection.send(controlPacket(arena.world, focusSlot, "Spectator"));
+  connection.send(controlPacket(arena.world, focusSlot, null));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
   connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now())));
   connection.send(arenaStatsPacket(arena));
   connection.send(statePacket(arena.world));
   if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
+}
+
+function changeSpectatedArena(connection, direction) {
+  const available = spectatorArenas();
+  if (!available.length) return connection.close("No active 4v4 games");
+  const currentIndex = available.indexOf(connection.arena);
+  const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + available.length) % available.length;
+  const nextArena = available[nextIndex];
+  if (connection.arena !== nextArena) {
+    connection.arena?.spectators.delete(connection);
+    connection.arena = nextArena;
+    nextArena.spectators.add(connection);
+  }
+  sendSpectatorEntry(connection, nextArena);
+  console.log(`Spectator switched to public arena ${nextArena.id} (${nextArena.connections.size}/8 players)`);
 }
 
 function changeConnectionMatch(connection) {
@@ -1414,15 +1435,20 @@ function installSharedUpgradeHandler(serverInstance) {
               }
               connection.arena = arena;
               connection.joined = true;
+              connection.ready = true;
               arena.spectators.add(connection);
               connection.send(mapPacket());
+              // Unlike player clients, NitroClash's native spectator path does
+              // not send opcode 3 after its ping sequence. The first match
+              // must follow the map immediately; opcode 7 subcommands 2/3 are
+              // reserved for switching to the next/previous match.
+              sendSpectatorEntry(connection, arena);
               console.log(`Spectator joined public arena ${arena.id} (${arena.connections.size}/8 players)`);
-            } else if (packet[1] === 2 && connection.joined && !connection.ready) {
-              connection.ready = true;
-              sendSpectatorEntry(connection, connection.arena);
+            } else if (packet[1] === 2 && connection.joined) {
+              changeSpectatedArena(connection, 1);
+            } else if (packet[1] === 3 && connection.joined) {
+              changeSpectatedArena(connection, -1);
             }
-            // Subcommands 3/4 only request camera changes in the stock client;
-            // the server deliberately applies no gameplay action.
             break;
           }
           case 2:
