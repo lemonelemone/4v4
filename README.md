@@ -1,6 +1,6 @@
 # NitroClash hosted 4v4
 
-Current userscript version: **3.6.0**
+Current userscript version: **3.6.1**
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
@@ -40,7 +40,7 @@ Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Bl
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.6.0** badge appears on the homepage.
+4. Confirm that the orange **HOSTED 4v4 v3.6.1** badge appears on the homepage.
 5. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
@@ -60,8 +60,9 @@ The userscript answers NitroClash's server-list and reservation requests with na
 - Version 3.5.1 fixes the native spectator startup sequence: the selected arena state is sent immediately after the map because spectator clients do not emit the normal player-ready packet. Real player names are preserved, left/right switches active public arenas, and a previously saved full-pitch camera is changed to follow the selected player when spectating begins.
 - Version 3.5.2 keeps reconnect identity current for the entire match and starts its 60-second expiry when the connection is actually lost. While a valid session exists, the homepage Reconnect button is placed directly beside the normal Play/Spectate controls; it remains hidden when no resumable session exists.
 - Version 3.5.3 shows the orange hosted-version badge only on the homepage. It is hidden while playing, spectating, reconnecting or viewing an interrupted match, and returns after going back home.
-- Version 3.6.0 makes ordinary **Spectate** enter the most populated public arena at its current live turn. A spectator-only **Watch from Start (5:00)** button reopens that arena's recorded state from kickoff, and changes to **Return to Live** while historical playback is active. Spectator playback remains outside all player slots and private arenas.
+- Version 3.6.0 made ordinary **Spectate** enter the most populated public arena at its current live turn.
 - Version 3.6.0 also binds reconnect intent to NitroClash's reservation response so the latency-check socket cannot consume it. The real game socket receives the saved public/private identity, party and team exactly once.
+- Version 3.6.1 removes the experimental **Watch from Start** spectator playback and its button. Spectating is live-only again; player capacity, private-game isolation and reconnect routing are unchanged.
 - The closed client still allocates ten compatibility slots internally. The userscript follows the trainer's display-tree technique: it finds only player sprites whose live physics position is deliberately outside the map and hides those sprites plus their paired markers at render time. The spare server bodies do not exist, while all real-player off-screen arrows stay enabled.
 - Render's free service can sleep after an idle period, so the first connection after inactivity can take longer while the server wakes. The userscript tests the hosted game WebSocket directly before supplying matchmaking, avoiding browser-dependent cross-site health requests.
 
