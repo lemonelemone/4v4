@@ -1,0 +1,14 @@
+{
+  "name": "nitroclash-local-4v4-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "planck": "1.4.2"
+  }
+}
