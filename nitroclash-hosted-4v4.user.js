@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.4.0
+// @version      3.4.1
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -398,7 +398,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.4";
+    badge.textContent = "HOSTED 4v4 v3.4.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

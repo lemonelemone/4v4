@@ -1,6 +1,6 @@
 # NitroClash hosted 4v4
 
-Current userscript version: **3.4.0**
+Current userscript version: **3.4.1**
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
@@ -8,7 +8,7 @@ During a goal replay, a left click/boost press votes to skip. The replay ends ea
 
 Stock party links and the **Private game** checkbox now route matches by their six-character party code. Each code owns an isolated arena, the displayed Team 1/Team 2 choice is preserved when the player name identifies one side, and private disconnects reserve that exact slot for 60 seconds. Public matchmaking never enters a private arena.
 
-In-game text and quick chat are relayed only to players in the same arena, with length and rate limits. At the results screen, **Change Team** leaves the ended match and enters an available non-full match; if none exists, the server creates a fresh arena and starts its kickoff.
+In-game text and quick chat are relayed only to players in the same arena, with length and rate limits. At the results screen, **Change Team** leaves the ended match and enters an available non-full match; if none exists, the server creates a fresh arena and starts its kickoff. Selecting **Rematch** keeps that player in the same arena and team. When the 30-second results timer expires, all rematch voters begin a reset match with a normal 3-2-1-GO kickoff; players who did not select Rematch are detached from that finished arena.
 
 The closed browser client has hard-coded layouts for 1v1, 2v2, 3v3 and 5v5. The prototype uses its 5v5 layout while hiding one unused slot on each team. The server therefore has eight visible player positions without requiring the original source code.
 
@@ -40,7 +40,7 @@ Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Bl
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.4** badge appears.
+4. Confirm that the orange **HOSTED 4v4 v3.4.1** badge appears.
 5. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
@@ -54,7 +54,7 @@ The userscript answers NitroClash's server-list and reservation requests with na
 - Up to eight real browser connections share each public arena and receive unique player slots. Full arenas cause the server to create another isolated match automatically.
 - Player acceleration, boost, braking, arena walls, player collisions and ball collisions now use Planck with the constants exposed by NitroClash's browser client.
 - Public slot allocation and one-minute reconnect identity are implemented. A public slot is released immediately; reconnect restores the original slot if free, otherwise prefers a free slot on the same team, and is refused when the previous match is full.
-- Private party routing and one-minute private slot reservation are implemented through the stock party interface. **Change Team** matchmaking is implemented; coordinated same-team rematches are still a future stage.
+- Private party routing and one-minute private slot reservation are implemented through the stock party interface. **Change Team** matchmaking and results-timer rematches are implemented.
 - The closed client still allocates ten compatibility slots internally. The userscript follows the trainer's display-tree technique: it finds only player sprites whose live physics position is deliberately outside the map and hides those sprites plus their paired markers at render time. The spare server bodies do not exist, while all real-player off-screen arrows stay enabled.
 - Render's free service can sleep after an idle period, so the first connection after inactivity can take longer while the server wakes.
 

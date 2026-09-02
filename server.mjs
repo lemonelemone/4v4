@@ -13,6 +13,7 @@ const CELEBRATION_TICKS = PHYSICS_HZ * 3;
 const REPLAY_TICKS = PHYSICS_HZ * 5;
 const REPLAY_HOLD_TICKS = PHYSICS_HZ * 2;
 const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
+const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
 const HIDDEN_SLOTS = new Set([8, 9]); // One unused slot per team => 4v4.
@@ -409,7 +410,7 @@ function gameOverPacket(world) {
   buffer[0] = 14;
   buffer.writeInt16BE(world.scores[0], 1);
   buffer.writeInt16BE(world.scores[1], 3);
-  buffer.writeInt32BE(30000, 5);
+  buffer.writeInt32BE(POSTGAME_MS, 5);
   let offset = 9;
   for (const stats of world.stats) {
     buffer[offset++] = stats.goals;
@@ -741,6 +742,8 @@ function createArena({ kind = "public", partyCode = null } = {}) {
     replayFrames: [],
     replayIndex: 0,
     replaySkipVotes: new Set(),
+    rematchVotes: new Set(),
+    rematchTimer: null,
     fullReplayFrames: [],
     lastReplayTurn: -1,
     cachedReplay: null,
@@ -808,10 +811,14 @@ function finishArena(arena) {
     .sort((a, b) => b.stats.points - a.stats.points || a.slot - b.slot);
   recordReplayEvent(arena.world, ACTION.VICTORY, winnerSlots[0]?.slot ?? winner, 255, 0, "");
   arena.phase = "ended";
+  arena.rematchVotes.clear();
   arenaSend(arena, arenaStatsPacket(arena));
   arenaSend(arena, gameOverPacket(arena.world));
   if (arena.loopTimer) clearTimeout(arena.loopTimer);
   arena.loopTimer = null;
+  if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
+  arena.rematchTimer = setTimeout(() => completeArenaRematch(arena), POSTGAME_MS);
+  arena.rematchTimer.unref?.();
 }
 
 function applyArenaInputs(arena) {
@@ -879,6 +886,8 @@ function registerReplaySkipVote(connection, previousFlags, nextFlags) {
 function retireEmptyArena(arena) {
   if (arena.loopTimer) clearTimeout(arena.loopTimer);
   arena.loopTimer = null;
+  if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
+  arena.rematchTimer = null;
   arena.phase = "retired";
   arenas.delete(arena.id);
   if (arena.kind === "private" && privateArenas.get(arena.partyCode) === arena)
@@ -1138,6 +1147,7 @@ function changeConnectionMatch(connection) {
   if (previousArena.connections.get(previousSlot) === connection)
     previousArena.connections.delete(previousSlot);
   previousArena.replaySkipVotes.delete(connection);
+  previousArena.rematchVotes.delete(connection);
   parkSlot(previousArena, previousSlot);
   arenaSend(previousArena, namePacket(previousSlot, ""));
 
@@ -1159,6 +1169,93 @@ function changeConnectionMatch(connection) {
     retireEmptyArena(previousArena);
   sendArenaEntry(connection, assignment.arena);
   console.log(`Change team ${connection.username}: arena ${previousArena.id} → ${assignment.arena.id}, slot ${assignment.slot + 1}`);
+  return true;
+}
+
+function registerRematchVote(connection) {
+  const arena = connection.arena;
+  if (!connection.ready || !arena || connection.slot === null || arena.phase !== "ended")
+    return false;
+  arena.rematchVotes.add(connection);
+  console.log(`Rematch selected by ${connection.username} in arena ${arena.id}`);
+  return true;
+}
+
+function detachFinishedConnection(arena, slot, connection) {
+  if (arena.connections.get(slot) === connection) arena.connections.delete(slot);
+  arena.replaySkipVotes.delete(connection);
+  arena.rematchVotes.delete(connection);
+  if (activeReservations.get(connection.reservationKey) === connection)
+    activeReservations.delete(connection.reservationKey);
+  connection.arena = null;
+  connection.slot = null;
+  connection.joined = false;
+  connection.ready = false;
+  connection.pendingInput = null;
+  connection.lastInputFlags = 0;
+  connection.resuming = false;
+}
+
+function completeArenaRematch(arena) {
+  if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
+  arena.rematchTimer = null;
+  if (arena.phase !== "ended" || arena.phase === "retired") return false;
+
+  // A finished match cannot carry reconnect reservations into the next game.
+  for (const [key, saved] of reconnectSessions) {
+    if (saved.arenaId === arena.id) reconnectSessions.delete(key);
+  }
+  arena.reservedSlots.clear();
+
+  const staying = [...arena.connections.entries()].filter(([, connection]) =>
+    arena.rematchVotes.has(connection) && connection.ready && !connection.cleaned);
+  const stayingConnections = new Set(staying.map(([, connection]) => connection));
+
+  for (const [slot, connection] of [...arena.connections.entries()]) {
+    if (stayingConnections.has(connection)) continue;
+    // Tell voters that this finished-match player is no longer in their roster,
+    // then detach the non-voter without producing a connection-lost popup.
+    for (const voter of stayingConnections) voter.send(namePacket(slot, ""));
+    detachFinishedConnection(arena, slot, connection);
+  }
+
+  if (!staying.length) {
+    retireEmptyArena(arena);
+    return false;
+  }
+
+  arena.world = makeWorld();
+  arena.kickoffSpawns = randomKickoffSpawns();
+  for (const slot of PLAYABLE_SLOTS) parkSlot(arena, slot);
+  for (const [slot, connection] of staying) {
+    connection.pendingInput = null;
+    connection.lastInputFlags = 0;
+    activateSlot(arena, slot, connection.username);
+    recordReplayEvent(arena.world, 200, slot, 255, 0, connection.username);
+  }
+
+  arena.started = true;
+  arena.phase = "playing";
+  arena.phaseTicks = 0;
+  arena.networkTick = 0;
+  arena.history = [];
+  arena.replayFrames = [];
+  arena.replayIndex = 0;
+  arena.replaySkipVotes.clear();
+  arena.rematchVotes.clear();
+  arena.fullReplayFrames = [];
+  arena.lastReplayTurn = -1;
+  arena.cachedReplay = null;
+  arena.startsAt = Date.now() + 4000;
+
+  const initial = statePacket(arena.world);
+  saveArenaReplayFrame(arena, initial);
+  arenaSend(arena, startPacket(arena.world));
+  arenaSend(arena, arenaStatsPacket(arena));
+  arenaSend(arena, initial);
+  arena.nextTickAt = performance.now() + TICK_MS;
+  arena.loopTimer = setTimeout(() => runArenaTick(arena), TICK_MS);
+  console.log(`Arena ${arena.id} rematch started with ${staying.length} player${staying.length === 1 ? "" : "s"}`);
   return true;
 }
 
@@ -1268,7 +1365,9 @@ function installSharedUpgradeHandler(serverInstance) {
             break;
           }
           case 5:
-            if (packet.length >= 2 && packet[1] === 1) changeConnectionMatch(connection);
+            if (packet.length < 2) break;
+            if (packet[1] === 0) registerRematchVote(connection);
+            else if (packet[1] === 1) changeConnectionMatch(connection);
             break;
           case 8: {
             if (!connection.ready) break;
@@ -1297,6 +1396,7 @@ function installSharedUpgradeHandler(serverInstance) {
       const playerState = playerSnapshot(arena.world.players[slot]);
       if (arena.connections.get(slot) === connection) arena.connections.delete(slot);
       arena.replaySkipVotes.delete(connection);
+      arena.rematchVotes.delete(connection);
       parkSlot(arena, slot);
       arenaSend(arena, namePacket(slot, ""));
       if (arena.kind === "private" && arena.phase !== "ended") {
@@ -1647,13 +1747,16 @@ export {
   buildNcrReplay,
   changeConnectionMatch,
   chatPacket,
+  completeArenaRematch,
   detectGoal,
+  finishArena,
   gameOverPacket,
   createArena,
   liveStatsPacket,
   makeWorld,
   ncrFrameFromStatePacket,
   recordGoal,
+  registerRematchVote,
   registerReplaySkipVote,
   server,
   statePacket,
