@@ -728,6 +728,7 @@ function createArena({ kind = "public", partyCode = null } = {}) {
     world,
     kickoffSpawns: randomKickoffSpawns(),
     connections: new Map(),
+    spectators: new Set(),
     reservedSlots: new Map(),
     kind,
     partyCode,
@@ -787,6 +788,16 @@ function arenaSend(arena, payload, opcode = 2) {
   for (const connection of arena.connections.values()) {
     if (connection.ready && !connection.cleaned) connection.send(payload, opcode);
   }
+  for (const spectator of arena.spectators) {
+    if (spectator.ready && !spectator.cleaned) spectator.send(payload, opcode);
+  }
+}
+
+function getSpectatorArena() {
+  return [...arenas.values()]
+    .filter((arena) => arena.kind === "public" && arena.phase !== "ended" &&
+      arena.phase !== "retired" && arena.connections.size > 0)
+    .sort((left, right) => right.connections.size - left.connections.size || left.id - right.id)[0] || null;
 }
 
 function arenaStatsPacket(arena) {
@@ -895,6 +906,11 @@ function retireEmptyArena(arena) {
   for (const [key, saved] of reconnectSessions) {
     if (saved.arenaId === arena.id) reconnectSessions.delete(key);
   }
+  for (const spectator of arena.spectators) {
+    spectator.arena = null;
+    spectator.send(Buffer.from([1]));
+  }
+  arena.spectators.clear();
   console.log(`${arena.kind === "private" ? `Private party ${arena.partyCode}` : "Public"} arena ${arena.id} emptied and was reset`);
 }
 
@@ -1056,18 +1072,29 @@ function assignPublicConnection(connection) {
   let restoredState = null;
   let reconnect = false;
   const saved = reconnectSessions.get(connection.reservationKey);
+  if (connection.reconnectRequested && (!saved || saved.expiresAt <= now)) {
+    if (saved) releaseReconnectSession(connection.reservationKey, saved);
+    return { error: "Reconnect expired" };
+  }
   if (saved && saved.kind === "public" && saved.expiresAt > now && saved.username === connection.username) {
     arena = arenas.get(saved.arenaId);
     if (arena?.kind === "public" && arena.phase !== "ended" && arena.phase !== "retired") {
       if (!arena.connections.has(saved.slot)) slot = saved.slot;
       else slot = chooseBalancedSlot(arena, saved.slot % 2);
-      if (slot === null) return { error: "previous match is full" };
+      if (slot === null) return { error: "Match full" };
       restoredState = slot === saved.slot ? saved.playerState : null;
       reconnect = true;
     }
   }
   if (saved) releaseReconnectSession(connection.reservationKey, saved);
+  if (connection.reconnectRequested && !arena) return { error: "Previous match no longer exists" };
   if (!arena) {
+    // A completely abandoned public arena remains resumable for its previous
+    // player, but unrelated matchmaking must start a genuinely fresh match.
+    for (const candidate of [...arenas.values()]) {
+      if (candidate.kind === "public" && candidate.started && candidate.connections.size === 0)
+        retireEmptyArena(candidate);
+    }
     arena = getOpenArena();
     slot = chooseBalancedSlot(arena);
   }
@@ -1091,6 +1118,10 @@ function assignPrivateConnection(connection) {
   const saved = reconnectSessions.get(connection.reservationKey);
   const validSaved = saved && saved.kind === "private" && saved.partyCode === connection.partyCode &&
     saved.expiresAt > now && saved.username === connection.username;
+  if (connection.reconnectRequested && !validSaved) {
+    if (saved) releaseReconnectSession(connection.reservationKey, saved);
+    return { error: saved?.expiresAt <= now ? "Reconnect expired" : "Private match no longer exists" };
+  }
   if (validSaved) {
     arena = arenas.get(saved.arenaId);
     if (arena?.kind === "private" && arena.partyCode === connection.partyCode &&
@@ -1101,6 +1132,10 @@ function assignPrivateConnection(connection) {
       reconnect = true;
     } else {
       arena = null;
+      if (connection.reconnectRequested) {
+        releaseReconnectSession(connection.reservationKey, saved);
+        return { error: "Private match no longer exists" };
+      }
     }
   }
   if (saved) releaseReconnectSession(connection.reservationKey, saved, !reconnect);
@@ -1136,6 +1171,17 @@ function sendArenaEntry(connection, arena) {
     connection.send(arenaStatsPacket(arena));
     connection.send(statePacket(arena.world));
   }
+}
+
+function sendSpectatorEntry(connection, arena) {
+  const focusSlot = [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
+  connection.send(controlPacket(arena.world, focusSlot, "Spectator"));
+  connection.send(Buffer.from([11, 8, 0]));
+  connection.send(Buffer.from([11, 9, 0]));
+  connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now())));
+  connection.send(arenaStatsPacket(arena));
+  connection.send(statePacket(arena.world));
+  if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
 }
 
 function changeConnectionMatch(connection) {
@@ -1273,6 +1319,8 @@ function installSharedUpgradeHandler(serverInstance) {
     const privateParty = upgradeUrl.searchParams.get("private") === "1" && /^[A-HJ-NP-Z0-9]{6}$/.test(requestedParty);
     const requestedTeamText = upgradeUrl.searchParams.get("team");
     const requestedTeam = requestedTeamText === "0" || requestedTeamText === "1" ? Number(requestedTeamText) : null;
+    const reconnectRequested = upgradeUrl.searchParams.get("reconnect") === "1";
+    const spectatorRequested = upgradeUrl.searchParams.get("spectate") === "1";
     const key = request.headers["sec-websocket-key"];
     if (!key) return socket.destroy();
     const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
@@ -1295,11 +1343,21 @@ function installSharedUpgradeHandler(serverInstance) {
       lastInputFlags: 0,
       lastChatAt: 0,
       resuming: false,
+      spectator: spectatorRequested,
+      reconnectRequested,
       kind: privateParty ? "private" : "public",
       partyCode: privateParty ? requestedParty : null,
       requestedTeam: privateParty ? requestedTeam : null,
       send(payload, opcode = 2) {
         if (socket.writable) socket.write(wsFrame(payload, opcode));
+      },
+      close(reason) {
+        if (!socket.writable) return;
+        const text = Buffer.from(String(reason || "Connection closed").slice(0, 120), "utf8");
+        const payload = Buffer.alloc(2 + text.length);
+        payload.writeUInt16BE(4000, 0);
+        text.copy(payload, 2);
+        socket.end(wsFrame(payload, 8));
       },
     };
 
@@ -1313,12 +1371,17 @@ function installSharedUpgradeHandler(serverInstance) {
             connection.send(Buffer.from([99]));
             break;
           case 1: {
+            if (connection.spectator) break;
             if (connection.joined) break;
             connection.reservationKey = packet.length >= 5 ? packet.readInt32BE(1) : 0;
             const name = readString(packet, 5);
             connection.username = name.value || "Player";
             const active = activeReservations.get(connection.reservationKey);
             if (active && active !== connection && !active.cleaned) {
+              if (connection.reconnectRequested) {
+                connection.close("Reconnect already active");
+                break;
+              }
               const copiedKey = connection.reservationKey;
               connection.reservationKey = createUnusedReservationKey();
               console.log(`Duplicate browser-tab key ${copiedKey} for ${connection.username}; assigned a separate player identity`);
@@ -1328,7 +1391,7 @@ function installSharedUpgradeHandler(serverInstance) {
               : assignPublicConnection(connection);
             if (assignment.error) {
               console.log(`${connection.kind === "private" ? `Private party ${connection.partyCode}` : "Public"} join rejected for ${connection.username}: ${assignment.error}`);
-              socket.end(wsFrame(Buffer.alloc(0), 8));
+              connection.close(assignment.error);
               break;
             }
             connection.joined = true;
@@ -1336,7 +1399,37 @@ function installSharedUpgradeHandler(serverInstance) {
             connection.send(mapPacket());
             break;
           }
+          case 7: {
+            if (!connection.spectator || packet.length < 2) break;
+            if (packet[1] === 1) {
+              if (connection.joined) break;
+              if (connection.kind === "private") {
+                connection.close("Private spectating is disabled");
+                break;
+              }
+              const arena = getSpectatorArena();
+              if (!arena) {
+                connection.close("No active 4v4 games");
+                break;
+              }
+              connection.arena = arena;
+              connection.joined = true;
+              arena.spectators.add(connection);
+              connection.send(mapPacket());
+              console.log(`Spectator joined public arena ${arena.id} (${arena.connections.size}/8 players)`);
+            } else if (packet[1] === 2 && connection.joined && !connection.ready) {
+              connection.ready = true;
+              sendSpectatorEntry(connection, connection.arena);
+            }
+            // Subcommands 3/4 only request camera changes in the stock client;
+            // the server deliberately applies no gameplay action.
+            break;
+          }
           case 2:
+            if (connection.spectator) {
+              connection.send(Buffer.from([4]));
+              break;
+            }
             if (packet.length >= 6 && connection.joined) {
               const previousFlags = connection.lastInputFlags;
               connection.lastInputFlags = packet[5];
@@ -1346,6 +1439,7 @@ function installSharedUpgradeHandler(serverInstance) {
             connection.send(Buffer.from([4]));
             break;
           case 3: {
+            if (connection.spectator) break;
             if (!connection.joined || connection.ready) break;
             connection.ready = true;
             const arena = connection.arena;
@@ -1354,6 +1448,7 @@ function installSharedUpgradeHandler(serverInstance) {
             break;
           }
           case 4: {
+            if (connection.spectator) break;
             if (!connection.ready || !connection.arena || connection.slot === null) break;
             const now = Date.now();
             if (now - connection.lastChatAt < 350) break;
@@ -1365,6 +1460,7 @@ function installSharedUpgradeHandler(serverInstance) {
             break;
           }
           case 5:
+            if (connection.spectator) break;
             if (packet.length < 2) break;
             if (packet[1] === 0) registerRematchVote(connection);
             else if (packet[1] === 1) changeConnectionMatch(connection);
@@ -1391,6 +1487,11 @@ function installSharedUpgradeHandler(serverInstance) {
       if (activeReservations.get(connection.reservationKey) === connection)
         activeReservations.delete(connection.reservationKey);
       const arena = connection.arena;
+      if (connection.spectator) {
+        arena?.spectators.delete(connection);
+        if (arena) console.log(`Spectator left public arena ${arena.id}`);
+        return;
+      }
       if (!connection.joined || !arena || connection.slot === null) return;
       const slot = connection.slot;
       const playerState = playerSnapshot(arena.world.players[slot]);
@@ -1402,11 +1503,18 @@ function installSharedUpgradeHandler(serverInstance) {
       if (arena.kind === "private" && arena.phase !== "ended") {
         rememberReconnectSession(connection, arena, slot, playerState);
         maybeCompleteReplaySkip(arena);
-      } else if (arena.connections.size === 0) {
-        retireEmptyArena(arena);
       } else if (arena.phase !== "ended") {
         rememberReconnectSession(connection, arena, slot, playerState);
         maybeCompleteReplaySkip(arena);
+        if (arena.connections.size === 0) {
+          const retirementTimer = setTimeout(() => {
+            const saved = reconnectSessions.get(connection.reservationKey);
+            if (arena.connections.size === 0 && (!saved || saved.arenaId !== arena.id)) retireEmptyArena(arena);
+          }, RECONNECT_TTL_MS + 100);
+          retirementTimer.unref?.();
+        }
+      } else if (arena.connections.size === 0) {
+        retireEmptyArena(arena);
       }
       console.log(`Disconnect ${connection.username} from arena ${arena.id}, slot ${slot + 1}; ${arena.kind === "private" ? "private slot reserved for 60s" : "public slot released immediately"}`);
     };

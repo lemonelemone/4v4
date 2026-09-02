@@ -1,6 +1,6 @@
 # NitroClash hosted 4v4
 
-Current userscript version: **3.4.3**
+Current userscript version: **3.5.0**
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
@@ -40,7 +40,7 @@ Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Bl
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.4.3** badge appears.
+4. Confirm that the orange **HOSTED 4v4 v3.5.0** badge appears.
 5. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
@@ -55,6 +55,8 @@ The userscript answers NitroClash's server-list and reservation requests with na
 - Player acceleration, boost, braking, arena walls, player collisions and ball collisions now use Planck with the constants exposed by NitroClash's browser client.
 - Public slot allocation and one-minute reconnect identity are implemented. A public slot is released immediately; reconnect restores the original slot if free, otherwise prefers a free slot on the same team, and is refused when the previous match is full.
 - Private party routing and one-minute private slot reservation are implemented through the stock party interface. **Change Team** matchmaking and results-timer rematches are implemented.
+- A Reconnect button appears after a dropped connection and on the homepage while the saved one-minute session is valid. It prevents overlapping attempts and reports expired, full and missing-match failures. Reloading retains the reconnect identity; private reconnects retain their party code, team and exact reserved slot.
+- The stock **Spectate** button uses NitroClash's native spectator protocol. It selects the most populated active public 4v4 arena, works when all eight player slots are occupied, receives the complete match broadcast, and has no player body, controls, votes or capacity cost. Private arenas are never listed or selected. If no public match is active, the browser reports **No active 4v4 games**.
 - The closed client still allocates ten compatibility slots internally. The userscript follows the trainer's display-tree technique: it finds only player sprites whose live physics position is deliberately outside the map and hides those sprites plus their paired markers at render time. The spare server bodies do not exist, while all real-player off-screen arrows stay enabled.
 - Render's free service can sleep after an idle period, so the first connection after inactivity can take longer while the server wakes. The userscript tests the hosted game WebSocket directly before supplying matchmaking, avoiding browser-dependent cross-site health requests.
 

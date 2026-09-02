@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.4.3
+// @version      3.5.0
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -18,6 +18,30 @@
   const NativeWebSocket = win.WebSocket;
   const NativeXMLHttpRequest = win.XMLHttpRequest;
   const gameServerUrl = "wss://fourv4-s2fb.onrender.com";
+  const reconnectStorageName = "nc4v4-reconnect-session";
+  let reconnectRequested = false;
+  let spectateRequested = false;
+  let connectionAttemptActive = false;
+  const readReconnectSession = () => {
+    try {
+      const session = JSON.parse(win.localStorage.getItem(reconnectStorageName) || "null");
+      if (!session || !Number.isFinite(session.expiresAt) || session.expiresAt <= Date.now()) {
+        win.localStorage.removeItem(reconnectStorageName);
+        return null;
+      }
+      return session;
+    } catch (_) { return null; }
+  };
+  const saveReconnectSession = (route) => {
+    try {
+      win.localStorage.setItem(reconnectStorageName, JSON.stringify({
+        expiresAt: Date.now() + 60000,
+        kind: route ? "private" : "public",
+        partyCode: route?.partyCode || null,
+        team: route?.team ?? null,
+      }));
+    } catch (_) {}
+  };
   const gameServerReady = new Promise((resolve) => {
     const startedAt = Date.now();
     const probe = () => {
@@ -268,14 +292,46 @@
     const text = String(url);
     const isNitroSocket = /^wss?:\/\/[^/]*nitroclash\.io(?::\d+)?\/\d+\/?$/i.test(text);
     let finalUrl = isNitroSocket ? gameServerUrl : url;
-    const privateRoute = isNitroSocket ? currentPrivatePartyRoute() : null;
+    const savedReconnect = reconnectRequested ? readReconnectSession() : null;
+    const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : currentPrivatePartyRoute()) : null;
+    const spectatorSocket = isNitroSocket && spectateRequested;
     if (privateRoute) {
       const teamQuery = privateRoute.team === null ? "" : `&team=${privateRoute.team}`;
       finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
       console.log(`[nc-local-4v4] private party ${privateRoute.partyCode}${privateRoute.team === null ? "" : `, team ${privateRoute.team + 1}`}`);
     }
+    if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}spectate=1`;
+    if (isNitroSocket && reconnectRequested) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
     if (isNitroSocket) console.log(`[nc-local-4v4] ${text} → ${finalUrl}`);
-    return protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
+    const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
+    if (isNitroSocket) {
+      const wasReconnect = reconnectRequested;
+      reconnectRequested = false;
+      spectateRequested = false;
+      connectionAttemptActive = true;
+      const nativeSend = socket.send;
+      socket.send = function (data) {
+        try {
+          const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) :
+            ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          // Server ping sockets send opcode 99. Record reconnect eligibility
+          // only when the stock client sends a real player join (opcode 1).
+          if (!spectatorSocket && !wasReconnect && bytes?.[0] === 1) saveReconnectSession(privateRoute);
+        } catch (_) {}
+        return nativeSend.call(this, data);
+      };
+      socket.addEventListener("open", () => { connectionAttemptActive = false; });
+      socket.addEventListener("close", (event) => {
+        connectionAttemptActive = false;
+        const reason = String(event.reason || "");
+        if (/Reconnect expired|Match full|Previous match no longer exists|Private match no longer exists/i.test(reason)) {
+          try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
+        }
+        win.__nc4v4LastConnectionMessage = reason;
+        if (spectatorSocket && reason) setTimeout(() => win.alert(reason), 0);
+      });
+    }
+    return socket;
   }
   LocalWebSocket.prototype = NativeWebSocket.prototype;
   for (const name of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) LocalWebSocket[name] = NativeWebSocket[name];
@@ -377,27 +433,27 @@
 
   function installInterface() {
     if (!document.body) return false;
-    const installReconnectButton = () => {
-      const panel = document.getElementById("connection-lost");
-      if (!panel || document.getElementById("nc-local-4v4-reconnect")) return;
+    const installReconnectButton = (panel, suffix) => {
+      if (!panel || document.getElementById(`nc-local-4v4-reconnect-${suffix}`)) return;
       const button = document.createElement("button");
-      button.id = "nc-local-4v4-reconnect";
+      button.id = `nc-local-4v4-reconnect-${suffix}`;
       button.type = "button";
       button.className = "button";
       button.textContent = "Reconnect";
-      button.title = "Try to rejoin your previous public match within 60 seconds";
+      button.title = "Try to rejoin your previous 4v4 match within 60 seconds";
       Object.assign(button.style, { display: "block", margin: "18px auto 0", padding: "10px 24px" });
       button.addEventListener("click", () => {
+        if (connectionAttemptActive || !readReconnectSession()) return;
+        reconnectRequested = true;
+        connectionAttemptActive = true;
         button.disabled = true;
         button.textContent = "Reconnecting...";
         try {
-          panel.style.display = "none";
+          if (suffix === "lost") panel.style.display = "none";
           win.nitroclash.backToHomepage();
           setTimeout(() => {
             win.nitroclash.selectMode(4);
             win.nitroclash.clickPlay();
-            button.disabled = false;
-            button.textContent = "Reconnect";
           }, 100);
         } catch (error) {
           button.disabled = false;
@@ -419,14 +475,35 @@
           button.textContent = button.textContent.replace(/5\s*(?:vs\.?|v)\s*5/i, "4 VS 4");
         button.title = "Hosted 4v4 (internally uses the 5v5 client layout)";
       }
-      installReconnectButton();
+      const session = readReconnectSession();
+      installReconnectButton(document.getElementById("connection-lost"), "lost");
+      installReconnectButton(document.getElementById("homepage-content"), "home");
+      for (const reconnectButton of document.querySelectorAll('[id^="nc-local-4v4-reconnect-"]')) {
+        reconnectButton.style.display = session ? "block" : "none";
+        if (!connectionAttemptActive && reconnectButton.textContent === "Reconnecting...") {
+          reconnectButton.disabled = false;
+          reconnectButton.textContent = win.__nc4v4LastConnectionMessage || "Reconnect";
+        }
+      }
+      if (win.nitroclash && !win.nitroclash.clickSpectate?.__nc4v4Wrapped) {
+        const originalSpectate = win.nitroclash.clickSpectate;
+        if (typeof originalSpectate === "function") {
+          const wrappedSpectate = function (...args) {
+            spectateRequested = true;
+            reconnectRequested = false;
+            return originalSpectate.apply(this, args);
+          };
+          wrappedSpectate.__nc4v4Wrapped = true;
+          win.nitroclash.clickSpectate = wrappedSpectate;
+        }
+      }
     };
     relabel();
     if (!win.__nc4v4RelabelTimer) win.__nc4v4RelabelTimer = setInterval(relabel, 500);
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.4.3";
+    badge.textContent = "HOSTED 4v4 v3.5.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
