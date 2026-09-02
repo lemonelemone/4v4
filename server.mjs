@@ -748,6 +748,7 @@ function createArena({ kind = "public", partyCode = null } = {}) {
     rematchVotes: new Set(),
     rematchTimer: null,
     fullReplayFrames: [],
+    spectatorFrames: [],
     lastReplayTurn: -1,
     cachedReplay: null,
   };
@@ -791,7 +792,7 @@ function arenaSend(arena, payload, opcode = 2) {
     if (connection.ready && !connection.cleaned) connection.send(payload, opcode);
   }
   for (const spectator of arena.spectators) {
-    if (spectator.ready && !spectator.cleaned) spectator.send(payload, opcode);
+    if (spectator.ready && !spectator.cleaned && !spectator.playbackActive) spectator.send(payload, opcode);
   }
 }
 
@@ -815,6 +816,11 @@ function saveArenaReplayFrame(arena, snapshot) {
   const turn = snapshot.readInt32BE(2);
   if (turn <= arena.lastReplayTurn) return;
   arena.fullReplayFrames.push(ncrFrameFromStatePacket(snapshot, arena.world.boosts));
+  arena.spectatorFrames.push({
+    packet: Buffer.from(snapshot),
+    scores: [...arena.world.scores],
+    recordedAt: Date.now(),
+  });
   arena.lastReplayTurn = turn;
   arena.cachedReplay = null;
 }
@@ -1180,6 +1186,11 @@ function sendArenaEntry(connection, arena) {
 }
 
 function sendSpectatorEntry(connection, arena) {
+  if (connection.spectateFromStart && arena.spectatorFrames.length) {
+    startSpectatorPlayback(connection, arena);
+    return;
+  }
+  connection.playbackActive = false;
   const focusSlot = [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
   connection.send(controlPacket(arena.world, focusSlot, null));
   connection.send(Buffer.from([11, 8, 0]));
@@ -1190,6 +1201,86 @@ function sendSpectatorEntry(connection, arena) {
   if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
 }
 
+function startPacketFromState(packet, countdownMs = 0) {
+  const buffer = Buffer.alloc(9 + CLIENT_SLOTS * 12 + 12);
+  buffer[0] = 9;
+  buffer.writeInt32BE(packet.readInt32BE(2), 1);
+  buffer.writeInt32BE(countdownMs, 5);
+  let destination = 9;
+  for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
+    const source = 6 + slot * 33;
+    packet.copy(buffer, destination, source, source + 12);
+    destination += 12;
+  }
+  const ballSource = 6 + CLIENT_SLOTS * 33;
+  packet.copy(buffer, destination, ballSource, ballSource + 12);
+  return buffer;
+}
+
+function stopSpectatorPlayback(connection) {
+  if (connection.playbackTimer) clearTimeout(connection.playbackTimer);
+  connection.playbackTimer = null;
+  connection.playbackActive = false;
+}
+
+function startSpectatorPlayback(connection, arena) {
+  stopSpectatorPlayback(connection);
+  const first = arena.spectatorFrames[0];
+  if (!first) return sendSpectatorEntry(connection, arena);
+  connection.playbackActive = true;
+  connection.playbackIndex = 0;
+  connection.playbackScores = [0, 0];
+  connection.playbackLastState = first.packet[1];
+  const focusSlot = [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
+  const control = controlPacket(arena.world, focusSlot, null);
+  control.writeInt32BE(first.packet.readInt32BE(2), 3);
+  control.writeInt16BE(0, 11);
+  control.writeInt16BE(0, 13);
+  connection.send(control);
+  connection.send(Buffer.from([11, 8, 0]));
+  connection.send(Buffer.from([11, 9, 0]));
+  const initialDelay = arena.spectatorFrames[1]
+    ? Math.max(0, arena.spectatorFrames[1].recordedAt - first.recordedAt)
+    : 0;
+  connection.send(startPacketFromState(first.packet, initialDelay));
+  connection.send(first.packet);
+
+  const advance = () => {
+    if (connection.cleaned || !connection.playbackActive || connection.arena !== arena) return;
+    const nextIndex = connection.playbackIndex + 1;
+    const frame = arena.spectatorFrames[nextIndex];
+    if (!frame) {
+      if (arena.phase === "ended" || arena.phase === "retired") {
+        connection.send(arenaStatsPacket(arena));
+        connection.send(gameOverPacket(arena.world));
+        stopSpectatorPlayback(connection);
+        return;
+      }
+      connection.playbackTimer = setTimeout(advance, 20);
+      return;
+    }
+    connection.playbackIndex = nextIndex;
+    for (let team = 0; team < 2; team++) {
+      if (frame.scores[team] > connection.playbackScores[team]) {
+        const turn = frame.packet.readInt32BE(2);
+        const event = [...arena.world.replayEvents].reverse().find((item) =>
+          item.type === 202 && item.turn <= turn && item.slot1 % 2 === team);
+        connection.send(goalPacket({ turn }, team, event?.slot1 ?? team, event?.slot2 ?? 255, event?.speed ?? 0));
+        connection.playbackScores = [...frame.scores];
+      }
+    }
+    if (frame.packet[1] === 7 && connection.playbackLastState !== 7)
+      connection.send(replayStartPacket(frame.packet.readInt32BE(2), REPLAY_TICKS));
+    connection.playbackLastState = frame.packet[1];
+    connection.send(frame.packet);
+    const delay = Math.max(1, Math.min(5000, (arena.spectatorFrames[nextIndex + 1]?.recordedAt ??
+      frame.recordedAt + TICK_MS) - frame.recordedAt));
+    connection.playbackTimer = setTimeout(advance, delay);
+  };
+  connection.playbackTimer = setTimeout(advance, Math.max(1, initialDelay));
+  console.log(`Spectator playback started from 5:00 in public arena ${arena.id}`);
+}
+
 function changeSpectatedArena(connection, direction) {
   const available = spectatorArenas();
   if (!available.length) return connection.close("No active 4v4 games");
@@ -1197,6 +1288,7 @@ function changeSpectatedArena(connection, direction) {
   const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + available.length) % available.length;
   const nextArena = available[nextIndex];
   if (connection.arena !== nextArena) {
+    stopSpectatorPlayback(connection);
     connection.arena?.spectators.delete(connection);
     connection.arena = nextArena;
     nextArena.spectators.add(connection);
@@ -1310,7 +1402,8 @@ function completeArenaRematch(arena) {
   arena.replayIndex = 0;
   arena.replaySkipVotes.clear();
   arena.rematchVotes.clear();
-  arena.fullReplayFrames = [];
+    arena.fullReplayFrames = [];
+    arena.spectatorFrames = [];
   arena.lastReplayTurn = -1;
   arena.cachedReplay = null;
   arena.startsAt = Date.now() + 4000;
@@ -1342,6 +1435,7 @@ function installSharedUpgradeHandler(serverInstance) {
     const requestedTeam = requestedTeamText === "0" || requestedTeamText === "1" ? Number(requestedTeamText) : null;
     const reconnectRequested = upgradeUrl.searchParams.get("reconnect") === "1";
     const spectatorRequested = upgradeUrl.searchParams.get("spectate") === "1";
+    const spectateFromStart = spectatorRequested && upgradeUrl.searchParams.get("fromStart") === "1";
     const key = request.headers["sec-websocket-key"];
     if (!key) return socket.destroy();
     const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
@@ -1365,6 +1459,9 @@ function installSharedUpgradeHandler(serverInstance) {
       lastChatAt: 0,
       resuming: false,
       spectator: spectatorRequested,
+      spectateFromStart,
+      playbackActive: false,
+      playbackTimer: null,
       reconnectRequested,
       kind: privateParty ? "private" : "public",
       partyCode: privateParty ? requestedParty : null,
@@ -1514,6 +1611,7 @@ function installSharedUpgradeHandler(serverInstance) {
         activeReservations.delete(connection.reservationKey);
       const arena = connection.arena;
       if (connection.spectator) {
+        stopSpectatorPlayback(connection);
         arena?.spectators.delete(connection);
         if (arena) console.log(`Spectator left public arena ${arena.id}`);
         return;

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.5.3
+// @version      3.6.0
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -21,7 +21,16 @@
   const reconnectStorageName = "nc4v4-reconnect-session";
   let reconnectRequested = false;
   let spectateRequested = false;
+  let spectateFromStartRequested = false;
+  let pendingGameSocketIntent = null;
+  let currentSpectatorMode = null;
+  let activeSpectatorSocket = null;
   let connectionAttemptActive = false;
+  const captureGameSocketIntent = () => {
+    pendingGameSocketIntent = spectateRequested
+      ? (spectateFromStartRequested ? "spectate-start" : "spectate-live")
+      : reconnectRequested ? "reconnect" : "play";
+  };
   const readReconnectSession = () => {
     try {
       const session = JSON.parse(win.localStorage.getItem(reconnectStorageName) || "null");
@@ -177,6 +186,7 @@
     send(body = null) {
       if (!this._fake) return this._native.send(body);
       const finish = () => {
+        if (this._fake.kind === "reservation") captureGameSocketIntent();
         this._status = 200;
         this._statusText = "OK";
         this._readyState = 4;
@@ -238,6 +248,7 @@
   })], { type: "application/json" }));
   let localReservationBlob = null;
   const makeLocalReservationBlob = () => {
+    captureGameSocketIntent();
     if (localReservationBlob) win.URL.revokeObjectURL(localReservationBlob);
     localReservationBlob = win.URL.createObjectURL(new win.Blob([
       `eu6.nitroclash.io:8003 ${reservationKey}`,
@@ -291,10 +302,26 @@
   function LocalWebSocket(url, protocols) {
     const text = String(url);
     const isNitroSocket = /^wss?:\/\/[^/]*nitroclash\.io(?::\d+)?\/\d+\/?$/i.test(text);
+    const pagePrivateRoute = isNitroSocket ? currentPrivatePartyRoute() : null;
+    let socketIntent = null;
+    if (isNitroSocket && pendingGameSocketIntent) {
+      socketIntent = pendingGameSocketIntent;
+      pendingGameSocketIntent = null;
+    } else if (isNitroSocket && spectateRequested) {
+      socketIntent = spectateFromStartRequested ? "spectate-start" : "spectate-live";
+    } else if (isNitroSocket && reconnectRequested) {
+      socketIntent = "reconnect";
+    } else if (isNitroSocket && pagePrivateRoute) {
+      // Party starts can open the game socket directly without the public
+      // reservation request used by ordinary matchmaking.
+      socketIntent = "play";
+    }
+    const reconnectSocket = socketIntent === "reconnect";
+    const spectatorSocket = socketIntent === "spectate-live" || socketIntent === "spectate-start";
+    const fromStartSocket = socketIntent === "spectate-start";
     let finalUrl = isNitroSocket ? gameServerUrl : url;
-    const savedReconnect = reconnectRequested ? readReconnectSession() : null;
-    const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : currentPrivatePartyRoute()) : null;
-    const spectatorSocket = isNitroSocket && spectateRequested;
+    const savedReconnect = reconnectSocket ? readReconnectSession() : null;
+    const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : pagePrivateRoute) : null;
     let spectatorFollowPending = false;
     if (spectatorSocket) {
       try {
@@ -308,17 +335,17 @@
       finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
       console.log(`[nc-local-4v4] private party ${privateRoute.partyCode}${privateRoute.team === null ? "" : `, team ${privateRoute.team + 1}`}`);
     }
-    if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}spectate=1`;
-    if (isNitroSocket && reconnectRequested) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
+    if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}spectate=1${fromStartSocket ? "&fromStart=1" : ""}`;
+    if (reconnectSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
     if (isNitroSocket) console.log(`[nc-local-4v4] ${text} → ${finalUrl}`);
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
-    if (isNitroSocket) {
-      const wasReconnect = reconnectRequested;
+    if (isNitroSocket && socketIntent) {
       let playerJoinSent = false;
       let matchEnded = false;
       let reconnectRefreshTimer = null;
       reconnectRequested = false;
       spectateRequested = false;
+      spectateFromStartRequested = false;
       connectionAttemptActive = true;
       const nativeSend = socket.send;
       socket.send = function (data) {
@@ -352,11 +379,19 @@
             // saved full-pitch camera to follow the selected real player.
             setTimeout(() => win.dispatchEvent(new win.KeyboardEvent("keyup", { key: "c", keyCode: 67, which: 67 })), 0);
           }
+          if (spectatorSocket && bytes?.[0] === 5) {
+            activeSpectatorSocket = socket;
+            currentSpectatorMode = fromStartSocket ? "start" : "live";
+          }
         } catch (_) {}
       });
       socket.addEventListener("close", (event) => {
         clearInterval(reconnectRefreshTimer);
         connectionAttemptActive = false;
+        if (activeSpectatorSocket === socket) {
+          activeSpectatorSocket = null;
+          currentSpectatorMode = null;
+        }
         const reason = String(event.reason || "");
         if (/Reconnect expired|Match full|Previous match no longer exists|Private match no longer exists/i.test(reason)) {
           try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
@@ -508,6 +543,37 @@
       else
         panel.appendChild(button);
     };
+    const installSpectatorHistoryButton = () => {
+      if (document.getElementById("nc-local-4v4-watch-start")) return;
+      const button = document.createElement("button");
+      button.id = "nc-local-4v4-watch-start";
+      button.type = "button";
+      button.className = "button";
+      Object.assign(button.style, {
+        display: "none", position: "fixed", left: "50%", bottom: "18px",
+        transform: "translateX(-50%)", zIndex: 999999, padding: "10px 18px",
+      });
+      button.addEventListener("click", () => {
+        if (connectionAttemptActive || !currentSpectatorMode) return;
+        const targetMode = currentSpectatorMode === "live" ? "start" : "live";
+        currentSpectatorMode = null;
+        spectateRequested = true;
+        spectateFromStartRequested = targetMode === "start";
+        reconnectRequested = false;
+        connectionAttemptActive = true;
+        button.disabled = true;
+        button.textContent = targetMode === "start" ? "Loading from 5:00..." : "Returning to live...";
+        try {
+          win.nitroclash.backToHomepage();
+          setTimeout(() => win.nitroclash.clickSpectate(), 100);
+        } catch (error) {
+          connectionAttemptActive = false;
+          button.disabled = false;
+          console.warn("[nc-local-4v4] could not change spectator timeline", error);
+        }
+      });
+      document.body.appendChild(button);
+    };
     const relabel = () => {
       const button = document.getElementById("gamemode-4") ||
         [...document.querySelectorAll("button")].find((candidate) => /5\s*(?:vs\.?|v)\s*5/i.test(candidate.textContent));
@@ -523,6 +589,7 @@
       const session = readReconnectSession();
       installReconnectButton(document.getElementById("connection-lost"), "lost");
       installReconnectButton(document.getElementById("homepage-loaded"), "home");
+      installSpectatorHistoryButton();
       for (const reconnectButton of document.querySelectorAll('[id^="nc-local-4v4-reconnect-"]')) {
         reconnectButton.style.display = session
           ? (reconnectButton.id.endsWith("-home") ? "inline-block" : "block")
@@ -544,6 +611,12 @@
           win.nitroclash.clickSpectate = wrappedSpectate;
         }
       }
+      const historyButton = document.getElementById("nc-local-4v4-watch-start");
+      if (historyButton) {
+        historyButton.style.display = currentSpectatorMode ? "block" : "none";
+        historyButton.disabled = false;
+        historyButton.textContent = currentSpectatorMode === "start" ? "Return to Live" : "Watch from Start (5:00)";
+      }
       const badge = document.getElementById("nc-local-4v4-badge");
       const homepage = document.getElementById("homepage");
       if (badge && homepage) {
@@ -557,7 +630,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.5.3";
+    badge.textContent = "HOSTED 4v4 v3.6.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
