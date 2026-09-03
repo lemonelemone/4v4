@@ -1,6 +1,6 @@
 # NitroClash hosted 4v4
 
-Current userscript version: **3.6.1**
+Current userscript version: **3.7.0**
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
@@ -40,14 +40,15 @@ Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Bl
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.6.1** badge appears on the homepage.
-5. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
+4. Confirm that the orange **HOSTED 4v4 v3.7.0** badge appears on the homepage.
+5. Leave the server set to **Frankfurt 1** for the new primary server, or choose **Frankfurt 2** to use the older Render fallback.
+6. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
 
 For a private test, create a party using NitroClash's normal **Create party** button, share its `#XXXXXX` link, arrange Team 1/Team 2, choose 4v4, tick **Private game**, and start normally. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
 
-The userscript answers NitroClash's server-list and reservation requests with native in-page blob responses, then redirects the resulting game socket to `wss://fourv4-s2fb.onrender.com`. Joining therefore no longer depends on NitroClash's public game matchmaking endpoint. Other unrelated website requests are left alone.
+The userscript answers NitroClash's server-list and reservation requests with native in-page blob responses. **Frankfurt 1** is the default and redirects game sockets to `wss://nitroclashio.duckdns.org`; **Frankfurt 2** redirects them to the older `wss://fourv4-s2fb.onrender.com` service. Play, private games, spectating and reconnecting all remain on the selected server, and reconnect records the original server so it cannot resume into the wrong host. Joining therefore no longer depends on NitroClash's public game matchmaking endpoint. Other unrelated website requests are left alone.
 
 ## Current limitations
 
@@ -63,8 +64,9 @@ The userscript answers NitroClash's server-list and reservation requests with na
 - Version 3.6.0 made ordinary **Spectate** enter the most populated public arena at its current live turn.
 - Version 3.6.0 also binds reconnect intent to NitroClash's reservation response so the latency-check socket cannot consume it. The real game socket receives the saved public/private identity, party and team exactly once.
 - Version 3.6.1 removes the experimental **Watch from Start** spectator playback and its button. Spectating is live-only again; player capacity, private-game isolation and reconnect routing are unchanged.
+- Version 3.7.0 adds two hosted choices to NitroClash's existing server selector. **Frankfurt 1** is the new default VPS, while **Frankfurt 2** keeps the original Render service available as a fallback. The selected endpoint controls latency checks, reservations, play, private games and spectating; reconnect sessions retain their original endpoint.
 - The closed client still allocates ten compatibility slots internally. The userscript follows the trainer's display-tree technique: it finds only player sprites whose live physics position is deliberately outside the map and hides those sprites plus their paired markers at render time. The spare server bodies do not exist, while all real-player off-screen arrows stay enabled.
-- Render's free service can sleep after an idle period, so the first connection after inactivity can take longer while the server wakes. The userscript tests the hosted game WebSocket directly before supplying matchmaking, avoiding browser-dependent cross-site health requests.
+- The Frankfurt 2 Render service can sleep after an idle period, so its first connection after inactivity can take longer while it wakes. The userscript tests both hosted game WebSockets directly before supplying matchmaking, avoiding browser-dependent cross-site health requests.
 
 ## Return to normal NitroClash
 

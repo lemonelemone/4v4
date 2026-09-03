@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.6.1
+// @version      3.7.0
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -17,7 +17,36 @@
   const win = unsafeWindow;
   const NativeWebSocket = win.WebSocket;
   const NativeXMLHttpRequest = win.XMLHttpRequest;
-  const gameServerUrl = "wss://fourv4-s2fb.onrender.com";
+  const defaultServerCode = "EU1";
+  const serverChoices = Object.freeze({
+    EU1: Object.freeze({
+      label: "Frankfurt 1",
+      fakeUri: "eu6.nitroclash.io:8003",
+      url: "wss://nitroclashio.duckdns.org",
+    }),
+    USE1: Object.freeze({
+      label: "Frankfurt 2",
+      fakeUri: "use1.nitroclash.io:8003",
+      url: "wss://fourv4-s2fb.onrender.com",
+    }),
+  });
+  const serverListResponse = Object.fromEntries(Object.entries(serverChoices).map(([code, choice]) => [
+    code,
+    { uri: choice.fakeUri, p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 },
+  ]));
+  const selectedServerCode = () => {
+    const code = String(document.getElementById("server")?.value || "");
+    return serverChoices[code] ? code : defaultServerCode;
+  };
+  const serverCodeForSocketUrl = (url) => {
+    try {
+      const hostname = new URL(String(url)).hostname.toLowerCase();
+      const match = Object.entries(serverChoices).find(([, choice]) =>
+        choice.fakeUri.split(":", 1)[0].toLowerCase() === hostname);
+      if (match) return match[0];
+    } catch (_) {}
+    return selectedServerCode();
+  };
   const reconnectStorageName = "nc4v4-reconnect-session";
   let reconnectRequested = false;
   let spectateRequested = false;
@@ -38,17 +67,18 @@
       return session;
     } catch (_) { return null; }
   };
-  const saveReconnectSession = (route, expiresAt = Date.now() + 60000) => {
+  const saveReconnectSession = (route, expiresAt = Date.now() + 60000, serverCode = selectedServerCode()) => {
     try {
       win.localStorage.setItem(reconnectStorageName, JSON.stringify({
         expiresAt,
         kind: route ? "private" : "public",
         partyCode: route?.partyCode || null,
         team: route?.team ?? null,
+        serverCode: serverChoices[serverCode] ? serverCode : defaultServerCode,
       }));
     } catch (_) {}
   };
-  const gameServerReady = new Promise((resolve) => {
+  const probeGameServer = (gameServerUrl) => new Promise((resolve) => {
     const startedAt = Date.now();
     const probe = () => {
       let settled = false;
@@ -83,6 +113,22 @@
       }
     };
     probe();
+  });
+  const gameServerReady = new Promise((resolve) => {
+    let failures = 0;
+    let settled = false;
+    for (const choice of Object.values(serverChoices)) {
+      probeGameServer(choice.url).then((ready) => {
+        if (settled) return;
+        if (ready) {
+          settled = true;
+          resolve(true);
+        } else if (++failures === Object.keys(serverChoices).length) {
+          settled = true;
+          resolve(false);
+        }
+      });
+    }
   });
   const reservationStorageName = "nc4v4-tab-reservation-key";
   function createReservationKey() {
@@ -188,8 +234,8 @@
         this._statusText = "OK";
         this._readyState = 4;
         this._responseText = this._fake.kind === "servers"
-          ? JSON.stringify({ EU1: { uri: "eu6.nitroclash.io:8003", p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 } })
-          : `eu6.nitroclash.io:8003 ${reservationKey}`;
+          ? JSON.stringify(serverListResponse)
+          : `${serverChoices[selectedServerCode()].fakeUri} ${reservationKey}`;
         this._response = this._responseType === "json" ? JSON.parse(this._responseText) : this._responseText;
         this._emit("readystatechange");
         this._emit("load");
@@ -240,15 +286,15 @@
   // Prefer the browser's own XHR implementation and redirect only the two
   // matchmaking calls to native same-origin blob responses. This avoids CORS,
   // mixed-content and private-network checks before the actual game socket.
-  const localServersBlob = win.URL.createObjectURL(new win.Blob([JSON.stringify({
-    EU1: { uri: "eu6.nitroclash.io:8003", p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 },
-  })], { type: "application/json" }));
+  const localServersBlob = win.URL.createObjectURL(new win.Blob([
+    JSON.stringify(serverListResponse),
+  ], { type: "application/json" }));
   let localReservationBlob = null;
   const makeLocalReservationBlob = () => {
     captureGameSocketIntent();
     if (localReservationBlob) win.URL.revokeObjectURL(localReservationBlob);
     localReservationBlob = win.URL.createObjectURL(new win.Blob([
-      `eu6.nitroclash.io:8003 ${reservationKey}`,
+      `${serverChoices[selectedServerCode()].fakeUri} ${reservationKey}`,
     ], { type: "text/plain" }));
     return localReservationBlob;
   };
@@ -315,8 +361,13 @@
     }
     const reconnectSocket = socketIntent === "reconnect";
     const spectatorSocket = socketIntent === "spectate-live";
-    let finalUrl = isNitroSocket ? gameServerUrl : url;
     const savedReconnect = reconnectSocket ? readReconnectSession() : null;
+    const requestedServerCode = isNitroSocket ? serverCodeForSocketUrl(text) : defaultServerCode;
+    const gameServerCode = reconnectSocket && serverChoices[savedReconnect?.serverCode]
+      ? savedReconnect.serverCode
+      : requestedServerCode;
+    const gameServerUrl = serverChoices[gameServerCode].url;
+    let finalUrl = isNitroSocket ? gameServerUrl : url;
     const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : pagePrivateRoute) : null;
     let spectatorFollowPending = false;
     if (spectatorSocket) {
@@ -351,9 +402,10 @@
           // only when the stock client sends a real player join (opcode 1).
           if (!spectatorSocket && bytes?.[0] === 1) {
             playerJoinSent = true;
-            saveReconnectSession(privateRoute);
+            saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode);
             clearInterval(reconnectRefreshTimer);
-            reconnectRefreshTimer = setInterval(() => saveReconnectSession(privateRoute), 15000);
+            reconnectRefreshTimer = setInterval(() =>
+              saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode), 15000);
           }
         } catch (_) {}
         return nativeSend.call(this, data);
@@ -388,7 +440,7 @@
             !/Reconnect expired|Match full|Previous match no longer exists|Private match no longer exists/i.test(reason)) {
           // Eligibility starts when the connection is lost, not when a
           // potentially five-minute match originally began.
-          saveReconnectSession(privateRoute, Date.now() + 60000);
+          saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode);
         }
         if (spectatorSocket && reason) setTimeout(() => win.alert(reason), 0);
       });
@@ -531,6 +583,36 @@
         panel.appendChild(button);
     };
     const relabel = () => {
+      const serverSelect = document.getElementById("server");
+      if (serverSelect) {
+        let serverLabelsChanged = false;
+        const hostedOptionsReady = Object.keys(serverChoices).every((code) =>
+          [...serverSelect.options].some((candidate) => candidate.value === code));
+        if (hostedOptionsReady && !win.__nc4v4ServerDefaultApplied) {
+          win.__nc4v4ServerDefaultApplied = true;
+          serverSelect.value = defaultServerCode;
+          serverSelect.dispatchEvent(new win.Event("change", { bubbles: true }));
+          serverLabelsChanged = true;
+        }
+        for (const [code, choice] of Object.entries(serverChoices)) {
+          const option = [...serverSelect.options].find((candidate) => candidate.value === code);
+          if (!option) continue;
+          const players = option.dataset.players || "0";
+          const label = `${choice.label} (${players})`;
+          if (option.textContent !== label) {
+            option.textContent = label;
+            serverLabelsChanged = true;
+          }
+        }
+        if (serverLabelsChanged) {
+          try { win.jQuery?.(serverSelect)?.selectmenu?.("refresh"); } catch (_) {}
+        }
+        const selectedChoice = serverChoices[serverSelect.value];
+        const selectedOption = [...serverSelect.options].find((candidate) => candidate.value === serverSelect.value);
+        const serverButtonText = document.querySelector("#server-button .ui-selectmenu-text");
+        if (selectedChoice && selectedOption && serverButtonText)
+          serverButtonText.textContent = selectedOption.textContent;
+      }
       const button = document.getElementById("gamemode-4") ||
         [...document.querySelectorAll("button")].find((candidate) => /5\s*(?:vs\.?|v)\s*5/i.test(candidate.textContent));
       if (button) {
@@ -579,7 +661,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.6.1";
+    badge.textContent = "HOSTED 4v4 v3.7.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
