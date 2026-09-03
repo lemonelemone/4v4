@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.7.0
+// @version      3.7.2
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -20,14 +20,9 @@
   const defaultServerCode = "EU1";
   const serverChoices = Object.freeze({
     EU1: Object.freeze({
-      label: "Frankfurt 1",
+      label: "Europe",
       fakeUri: "eu6.nitroclash.io:8003",
       url: "wss://nitroclashio.duckdns.org",
-    }),
-    USE1: Object.freeze({
-      label: "Frankfurt 2",
-      fakeUri: "use1.nitroclash.io:8003",
-      url: "wss://fourv4-s2fb.onrender.com",
     }),
   });
   const serverListResponse = Object.fromEntries(Object.entries(serverChoices).map(([code, choice]) => [
@@ -661,7 +656,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.7.0";
+    badge.textContent = "HOSTED 4v4 v3.7.2";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
