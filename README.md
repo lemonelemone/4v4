@@ -1,6 +1,8 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.15.1**
+Current release version: **3.15.2**
+
+Version 3.15.2 adds a homepage Show in-game spectators checkbox, enabled by default and saved in this browser. Turning it off hides the two spectator characters and their on-pitch name labels on your screen only. Other viewers, players, spectator movement and the separate spectator chat setting are unaffected. Turning it back on restores the characters and labels. Userscript-only update; server unchanged.
 
 Version 3.15.1 changes spectator characters and spectator chat names to purple. This is a userscript-only colour update; server.mjs is unchanged from v3.15.0. All earlier fixes remain.
 

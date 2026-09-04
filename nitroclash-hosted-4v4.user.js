@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.15.1
+// @version      3.15.2
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -280,6 +280,8 @@
     };
     transform.__ncObserverSensors=true;prototype.setTransform=transform;
   }
+  let showInGameSpectators = true;
+  try { showInGameSpectators = win.localStorage.getItem("nc4v4-show-ingame-spectators") !== "off"; } catch (_) {}
   let spectatorChatEnabled = true;
   try { spectatorChatEnabled = win.localStorage.getItem("nc4v4-spectator-chat") !== "off"; } catch (_) {}
 
@@ -328,6 +330,18 @@
       caption.textContent = " Spectator chat (4v4)";
       label.appendChild(caption);
       home.appendChild(label);
+    }
+    if(home && !document.getElementById("nc-show-ingame-spectators")) {
+      const label=document.createElement("label");
+      label.style.cssText="display:block;margin:8px;color:#d8b4ef;font:14px Arial";
+      const toggle=document.createElement("input");toggle.id="nc-show-ingame-spectators";toggle.type="checkbox";
+      toggle.checked=showInGameSpectators;
+      toggle.addEventListener("change",()=>{
+        showInGameSpectators=toggle.checked;
+        try{win.localStorage.setItem("nc4v4-show-ingame-spectators",showInGameSpectators ? "on" : "off");}catch(_){}
+      });
+      label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Show in-game spectators";label.appendChild(caption);
+      label.title="Only changes what you see. Spectator chat has its own setting.";home.appendChild(label);
     }
     const chat=document.getElementById("chat-block");
     if(!chat || document.getElementById("nc-spectator-chat-status"))return;
@@ -1022,6 +1036,10 @@
             node.removeChild(stale);
             stale.destroy?.();
           }
+          for(const label of labels.slice(-10).slice(8)) {
+            if(!showInGameSpectators){label.renderable=false;label.__ncHiddenObserver=true;}
+            else if(label.__ncHiddenObserver){label.renderable=true;delete label.__ncHiddenObserver;}
+          }
           for (let index = 0; index < children.length; index++) {
             const child = children[index];
             const position = child?.lastPhysicsPosition;
@@ -1047,7 +1065,11 @@
                 // An empty slot can become occupied after this client has
                 // already joined. Undo our old hidden state immediately.
                 restoreOccupiedSlot(child, children[index + 1]);
-                if(playerIndex===9 || playerIndex===10)greenObserver(child,children[index+1]);
+                if(playerIndex===9 || playerIndex===10) {
+                  greenObserver(child,children[index+1]);
+                  if(!showInGameSpectators){child.renderable=false;child.__ncHiddenObserver=true;}
+                  else if(child.__ncHiddenObserver){child.renderable=true;delete child.__ncHiddenObserver;}
+                }
               }
             }
             if (child?.children?.length) queue.push(child);
@@ -1272,7 +1294,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.15.1";
+    badge.textContent = "HOSTED 4v4 v3.15.2";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
