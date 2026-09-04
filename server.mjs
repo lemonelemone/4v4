@@ -1272,6 +1272,7 @@ function changeConnectionMatch(connection) {
   const assignment = connection.kind === "private"
     ? assignPrivateConnection(connection)
     : assignPublicConnection(connection);
+  maybeStartReadyRematch(previousArena);
   if (assignment.error) {
     console.error(`Could not change match for ${connection.username}: ${assignment.error}`);
     return false;
@@ -1284,12 +1285,21 @@ function changeConnectionMatch(connection) {
   return true;
 }
 
+function maybeStartReadyRematch(arena) {
+  if(!arena || arena.phase!=="ended")return false;
+  const remaining=[...arena.connections.values()].filter(c=>!c.cleaned);
+  if(remaining.length && !remaining.every(c=>c.ready && arena.rematchVotes.has(c)))return false;
+  return completeArenaRematch(arena);
+}
+
 function registerRematchVote(connection) {
   const arena = connection.arena;
   if (!connection.ready || !arena || connection.slot === null || arena.phase !== "ended")
     return false;
+  if(connection.spectator || arena.connections.get(connection.slot)!==connection)return false;
   arena.rematchVotes.add(connection);
   console.log(`Rematch selected by ${connection.username} in arena ${arena.id}`);
+  maybeStartReadyRematch(arena);
   return true;
 }
 
@@ -1404,6 +1414,14 @@ function handleSpectatorChat(connection, packet) {
   }
 }
 
+function onlinePlayerCount() {
+  let count=0;
+  for(const arena of arenas.values())for(const c of arena.connections.values())if(c.ready && !c.cleaned)count++;
+  return count;
+}
+function populationPingPacket() {
+  const packet=Buffer.alloc(5);packet[0]=99;packet.writeUInt32BE(onlinePlayerCount(),1);return packet;
+}
 function placeInGameSpectator(connection) {
   const player = connection.arena.world.players[connection.slot];
   // These two stock-layout positions have no physics bodies. Ghost movement
@@ -1416,11 +1434,13 @@ function moveInGameSpectators(arena) {
   for (const watcher of arena.spectators) {
     if (!watcher.inGameSpectator || !watcher.ready || watcher.cleaned) continue;
     const keys = performance.now() - (watcher.observerInputAt ?? -Infinity) < 600 ? watcher.observerKeys : 0;
-    const dx = Number(!!(keys & 8)) - Number(!!(keys & 4));
-    const dy = Number(!!(keys & 2)) - Number(!!(keys & 1));
+    const mouse=performance.now()-(watcher.observerInputAt ?? -Infinity)<600 ? watcher.observerMouse : null;
+    let dx = Number(!!(keys & 8)) - Number(!!(keys & 4));
+    let dy = Number(!!(keys & 2)) - Number(!!(keys & 1));
+    if(mouse){dx=Math.cos(mouse.angle)*mouse.speed;dy=Math.sin(mouse.angle)*mouse.speed;}
     if (!dx && !dy) continue;
     const player = arena.world.players[watcher.slot];
-    const distance = (keys & 16 ? 24 : 12) / PHYSICS_HZ / Math.hypot(dx, dy);
+    const distance = (keys & 16 ? 24 : 12) / PHYSICS_HZ / (mouse ? 1 : Math.hypot(dx, dy));
     player.x = Math.max(-15, Math.min(115, player.x + dx * distance));
     player.y = Math.max(-15, Math.min(75, player.y + dy * distance));
     player.angle = Math.atan2(dy, dx);
@@ -1506,19 +1526,26 @@ function installSharedUpgradeHandler(serverInstance) {
         switch (packet[0]) {
           case 26:
             if (packet[1] === 2 && connection.inGameSpectator) {
-              connection.send(Buffer.from([26, 2, 1])); // Ghost movement supported.
+              connection.send(Buffer.from([26, 2, 2])); // Ghost movement supported.
               break;
             }
             handleSpectatorChat(connection, packet);
             break;
           case 27:
             if (connection.inGameSpectator && connection.ready && packet.length === 2 && packet[1] <= 31) {
+              connection.observerMouse = null;
               connection.observerKeys = packet[1];
               connection.observerInputAt = performance.now();
             }
+            if (connection.inGameSpectator && connection.ready && packet.length===10 && packet[1]===32) {
+              const angle=packet.readFloatBE(2),speed=packet.readFloatBE(6);
+              if(Number.isFinite(angle) && Number.isFinite(speed) && speed>=0 && speed<=1) {
+                connection.observerMouse={angle,speed};connection.observerKeys=0;connection.observerInputAt=performance.now();
+              }
+            }
             break;
           case 99:
-            connection.send(Buffer.from([99]));
+            connection.send(populationPingPacket());
             break;
           case 1: {
             if (connection.inGameSpectator && !connection.joined) {
@@ -1694,8 +1721,8 @@ function installSharedUpgradeHandler(serverInstance) {
           }, RECONNECT_TTL_MS + 100);
           retirementTimer.unref?.();
         }
-      } else if (arena.connections.size === 0) {
-        retireEmptyArena(arena);
+      } else {
+        maybeStartReadyRematch(arena);
       }
       console.log(`Disconnect ${connection.username} from arena ${arena.id}, slot ${slot + 1}; ${arena.kind === "private" ? "private slot reserved for 60s" : "public slot released immediately"}`);
     };
@@ -1722,7 +1749,7 @@ const server = http.createServer((request, response) => {
   } else if (path === "/servers") {
     response.writeHead(200, { ...cors, "Content-Type": "application/json" });
     response.end(JSON.stringify({
-      EU1: { uri: "eu6.nitroclash.io:8003", p0: 0, p1: 0, p2: 0, p3: 0, p4: 0, p5: 0 },
+      EU1: { uri: "eu6.nitroclash.io:8003", p0: 0, p1: 0, p2: 0, p3: 0, p4: onlinePlayerCount(), p5: 0 },
     }));
   } else if (path === "/reserve") {
     response.writeHead(200, { ...cors, "Content-Type": "text/plain" });
@@ -2040,6 +2067,7 @@ export {
   changeConnectionMatch,
   chatPacket,
   completeArenaRematch,
+  maybeStartReadyRematch,
   detectGoal,
   finishArena,
   gameOverPacket,
@@ -2059,6 +2087,7 @@ export {
   probeConnectionPing,
   receiveConnectionPong,
   moveInGameSpectators,
+  onlinePlayerCount,
   server,
   statePacket,
 };

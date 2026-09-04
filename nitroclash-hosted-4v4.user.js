@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.12.1
+// @version      3.14.3
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -99,6 +99,7 @@
   let inGameSpectateRequested = false;
   let launchingInGameSpectate = false;
   const measuredServerPings = new Map();
+  const measuredServerPlayers = new Map();
   let nextPingRefresh = 0;
 
   function refreshMeasuredPings() {
@@ -114,6 +115,7 @@
         finished = true;
         clearTimeout(timeout);
         measuredServerPings.set(code, value);
+        if(value===null)measuredServerPlayers.set(code,null);
         try { socket?.close(); } catch (_) {}
         refreshModeControls();
       };
@@ -126,6 +128,7 @@
         socket.addEventListener("message", ({ data }) => {
           const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
           if (finished || bytes?.[0] !== 99) return;
+          measuredServerPlayers.set(code,bytes.length>=5 ? new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint32(1) : null);
           samples.push(Math.max(1, now() - sentAt));
           if (samples.length === 3) finish(Math.round(samples.sort((a,b) => a-b)[1]));
           else setTimeout(send, 50);
@@ -139,9 +142,14 @@
   let spectatorChatSupported = false;
   let spectatorChatWatching = false;
   let observerMovement = false;
+  let observerMouseSupported=false, observerPointer=null, observerSprite=null, observerRenderer=null, observerSlot=-1;
   let observerKeys = 0;
   let controlBodyCapture = null;
   let chatPending = false;
+  let consumedChatKey = null;
+  let chatRows = [];
+  let chatFadeTimer = null;
+  let sentChatText = "";
   let chatConfirmTimer = null;
   const setChatStatus = text => { const el = document.getElementById("nc-spectator-chat-status"); if (el) el.textContent = text; };
   function sendSpectatorMessage(text) {
@@ -154,39 +162,111 @@
     packet[0]=26; packet[1]=1; packet[2]=message.length;
     const view=new DataView(packet.buffer);
     for(let i=0;i<message.length;i++)view.setUint16(3+i*2,message.charCodeAt(i));
+    sentChatText = message;
     chatPending=true;
     spectatorChatSocket.send(packet);
     setChatStatus("Sending…");
     clearTimeout(chatConfirmTimer);
-    chatConfirmTimer=setTimeout(()=>{chatPending=false;setChatStatus("No confirmation received. Your text is kept; try Send again.");},4000);
+    chatConfirmTimer=setTimeout(()=>{chatPending=false;setChatStatus("No confirmation received. Your text is kept; press Enter to retry.");},4000);
   }
   function confirmSpectatorMessage() {
     if (!chatPending) return;
     chatPending=false; clearTimeout(chatConfirmTimer);
-    const input=document.getElementById("nc-spectator-chat-input"); if(input)input.value="";
+    const input=document.getElementById("chat-input");
+    if(input && input.value.trim().slice(0,255)===sentChatText){input.value="";input.blur();}
     setChatStatus("Sent");
   }
   function sendObserverKeys() {
-    if (observerMovement && spectatorChatSocket?.readyState===1) spectatorChatSocket.send(new Uint8Array([27,observerKeys]));
+    if(!observerMovement || spectatorChatSocket?.readyState!==1)return;
+    if(observerMouseSupported && observerPointer && !observerKeys && observerSprite && observerRenderer) {
+      const rect=observerRenderer.view.getBoundingClientRect(),pos=observerSprite.getGlobalPosition();
+      const dx=observerPointer.x-rect.left-pos.x*rect.width/(observerRenderer.width/observerRenderer.resolution);
+      const dy=observerPointer.y-rect.top-pos.y*rect.height/(observerRenderer.height/observerRenderer.resolution);
+      const packet=new Uint8Array(10),view=new DataView(packet.buffer);packet[0]=27;packet[1]=32;
+      view.setFloat32(2,Math.atan2(dy,dx));view.setFloat32(6,Math.min(1,Math.max(0,(Math.hypot(dx,dy)-8)/40)));
+      spectatorChatSocket.send(packet);return;
+    }
+    spectatorChatSocket.send(new Uint8Array([27,observerKeys]));
   }
+  win.addEventListener("mousemove",event=>{
+    if(!observerMovement || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || ""))return;
+    observerPointer={x:event.clientX,y:event.clientY};
+  },true);
+  function sendMatchChat(text) {
+    if(spectatorChatWatching){sendSpectatorMessage(text);return;}
+    const message=String(text).trim().slice(0,255);
+    if(message && spectatorChatSocket?.readyState===1) {
+      const packet=new Uint8Array(2+message.length*2),view=new DataView(packet.buffer);
+      packet[0]=4;packet[1]=message.length;
+      for(let i=0;i<message.length;i++)view.setUint16(2+i*2,message.charCodeAt(i));
+      spectatorChatSocket.send(packet);
+    }
+    const input=document.getElementById("chat-input");if(input){input.value="";input.blur();}
+  }
+  // Chat owns game shortcuts and pointer controls until it is sent or cancelled.
+  for(const type of ["pointerdown","pointerup","mousedown","mouseup","mousemove","click","wheel"])win.addEventListener(type,event=>{
+    if(spectatorChatSocket?.readyState!==1 || document.activeElement?.id!=="chat-input")return;
+    event.stopImmediatePropagation();
+    if(event.target?.id!=="chat-input" || type==="wheel")event.preventDefault();
+  },{capture:true,passive:false});
   // Capture before the game's keyboard handlers, preserving normal text input.
   for(const type of ["keydown","keyup","keypress"]) win.addEventListener(type,event=>{
-    if(event.target?.id === "nc-spectator-chat-input") {
-      event.stopImmediatePropagation();
-      if(type==="keydown" && event.key==="Enter") {event.preventDefault();sendSpectatorMessage(event.target.value);}
+    if(consumedChatKey===event.key) {
+      event.preventDefault();event.stopImmediatePropagation();
+      if(type==="keyup")consumedChatKey=null;
       return;
+    }
+    if(spectatorChatSocket?.readyState===1) {
+      const input=document.getElementById("chat-input");
+      const typing=/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "") || event.target?.isContentEditable;
+      if(event.target===input || document.activeElement===input) {
+        event.stopImmediatePropagation();
+        if(event.key==="Tab")event.preventDefault();
+        if(event.key==="Enter") {
+          event.preventDefault();
+          if(type==="keydown" && !event.repeat){
+            consumedChatKey="Enter";
+            if(input.value.trim())sendMatchChat(input.value);
+            else input.blur();
+          }
+        } else if(event.key==="Escape") {
+          event.preventDefault();consumedChatKey="Escape";input.value="";input.blur();
+          setChatStatus("Chat cancelled · T to chat");
+        }
+        else if(type==="keydown" && event.defaultPrevented && event.key?.length===1 && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing) {
+          // A previously registered game/extension handler may cancel typing.
+          // Recover only cancelled printable input, preserving native editing/IME.
+          input.setRangeText(event.key,input.selectionStart,input.selectionEnd,"end");
+          input.dispatchEvent(new Event("input",{bubbles:true}));
+        }
+        return;
+      }
+      if(!typing && (event.key?.toLowerCase()==="t" || event.key==="Enter")) {
+        event.preventDefault();event.stopImmediatePropagation();
+        if(type==="keyup" && input) {
+          input.disabled=false;input.readOnly=false;
+          const block=document.getElementById("chat-block");if(block)block.style.display="block";
+          input.focus();
+          const history=document.getElementById("chat-history");
+          if(history){history.style.display="block";history.style.opacity="1";}
+          if(!spectatorChatEnabled)setChatStatus("Spectator chat is off. Enable it on the homepage.");
+          else if(!spectatorChatSupported)setChatStatus("Spectator chat needs the updated server.");
+        }
+        return;
+      }
     }
     if(!observerMovement || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "") || event.target?.isContentEditable) return;
     const bit=({w:1,ArrowUp:1,s:2,ArrowDown:2,a:4,ArrowLeft:4,d:8,ArrowRight:8,Shift:16})[event.key?.length===1?event.key.toLowerCase():event.key];
     if(!bit)return;
+    observerPointer=null;
     event.preventDefault();event.stopImmediatePropagation();
     if(type==="keydown")observerKeys|=bit;
     if(type==="keyup")observerKeys&=~bit;
     sendObserverKeys();
   },true);
-  win.addEventListener("blur",()=>{observerKeys=0;sendObserverKeys();});
-  document.addEventListener?.("focusin",event=>{if(/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "")){observerKeys=0;sendObserverKeys();}});
-  setInterval(sendObserverKeys,250);
+  win.addEventListener("blur",()=>{observerKeys=0;observerPointer=null;sendObserverKeys();});
+  document.addEventListener?.("focusin",event=>{if(/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "")){observerKeys=0;observerPointer=null;sendObserverKeys();}});
+  setInterval(sendObserverKeys,50);
   function installObserverSensors() {
     const prototype=win.planck?.Body?.prototype;
     if(!prototype?.setTransform || prototype.setTransform.__ncObserverSensors)return;
@@ -203,21 +283,22 @@
   let spectatorChatEnabled = true;
   try { spectatorChatEnabled = win.localStorage.getItem("nc4v4-spectator-chat") !== "off"; } catch (_) {}
 
+  function renderMatchChat() {
+    const history=document.getElementById("chat-history");
+    if(!history)return;
+    history.replaceChildren(...chatRows.map(row=>row.cloneNode(true)));
+    history.style.display="block";history.style.opacity="1";
+    clearTimeout(chatFadeTimer);
+    chatFadeTimer=setTimeout(()=>{if(document.activeElement?.id!=="chat-input")history.style.display="none";},10000);
+  }
+  function appendMatchChat(row) {
+    chatRows.push(row.cloneNode(true));
+    if(chatRows.length>8)chatRows.shift();
+    renderMatchChat();
+  }
   function refreshSpectatorChat() {
-    const home = document.getElementById("homepage");
-    const atHome = home && home.style.display !== "none" &&
-      (!win.getComputedStyle || win.getComputedStyle(home).display !== "none");
-    const panel = document.getElementById("nc-spectator-chat");
-    if (!panel) return;
-    panel.style.display = spectatorChatEnabled && spectatorChatSocket?.readyState === 1 && !atHome ? "block" : "none";
-    const input = document.getElementById("nc-spectator-chat-input");
-    input.style.display = spectatorChatWatching ? "block" : "none";
-    input.disabled = !spectatorChatSupported;
-    document.getElementById("nc-spectator-chat-send").style.display = spectatorChatWatching ? "block" : "none";
-    document.getElementById("nc-observer-help").style.display = observerMovement ? "block" : "none";
-    if (!document.getElementById("nc-spectator-chat-status").textContent) document.getElementById("nc-spectator-chat-status").textContent = !spectatorChatSupported
-      ? "Spectator chat needs the updated 4v4 server."
-      : spectatorChatWatching ? "Same match · Enter to send" : "Same match · Reply using normal game chat";
+    const status=document.getElementById("nc-spectator-chat-status");
+    if(status)status.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 ? "block" : "none";
   }
 
   function subscribeSpectatorChat() {
@@ -238,8 +319,8 @@
       toggle.addEventListener("change", () => {
         spectatorChatEnabled = toggle.checked;
         try { win.localStorage.setItem("nc4v4-spectator-chat", spectatorChatEnabled ? "on" : "off"); } catch (_) {}
-        const history = document.getElementById("nc-spectator-chat-history");
-        if (history) history.textContent = "";
+        chatRows=chatRows.filter(row=>!row.classList.contains("nc-spectator-message"));
+        if(spectatorChatSocket?.readyState===1)renderMatchChat();
         subscribeSpectatorChat();
       });
       label.appendChild(toggle);
@@ -248,55 +329,25 @@
       label.appendChild(caption);
       home.appendChild(label);
     }
-    if (!document.body || document.getElementById("nc-spectator-chat")) return;
-    const panel = document.createElement("section");
-    panel.id = "nc-spectator-chat";
-    panel.style.cssText = "display:none;position:fixed;right:12px;bottom:16px;width:290px;max-width:40vw;padding:10px;background:rgba(0,0,0,.78);color:#fff;border:1px solid #398568;border-radius:5px;z-index:10000;font:13px Arial";
-    const title = document.createElement("strong");
-    title.textContent = "Spectator chat";
-    panel.appendChild(title);
-    const history = document.createElement("div");
-    history.id = "nc-spectator-chat-history";
-    history.style.cssText = "max-height:150px;overflow-y:auto;overflow-wrap:anywhere;margin:6px 0";
-    panel.appendChild(history);
-    const status = document.createElement("div");
-    status.id = "nc-spectator-chat-status";
-    status.style.cssText = "font-size:11px;color:#ccc;margin:5px 0";
-    panel.appendChild(status);
-    const input = document.createElement("input");
-    input.id = "nc-spectator-chat-input";
-    input.type = "text";
-    input.maxLength = 255;
-    input.placeholder = "Message this match…";
-    input.setAttribute?.("aria-label", "Spectator message");
-    input.style.cssText = "box-sizing:border-box;width:100%;padding:6px;color:white;background:#222;border:1px solid #777";
-    for (const type of ["keydown", "keyup", "keypress", "mousedown", "mouseup", "click"])
-      input.addEventListener(type, event => {
-        event.stopPropagation();
-        if (type !== "keydown" || event.key !== "Enter") return;
-        event.preventDefault();
-        sendSpectatorMessage(input.value);
-      });
-    panel.appendChild(input);
-    const send=document.createElement("button");
-    send.id="nc-spectator-chat-send";send.type="button";send.textContent="Send";
-    send.style.cssText="margin-top:6px;width:100%;padding:6px;cursor:pointer";
-    send.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();sendSpectatorMessage(input.value);});
-    panel.appendChild(send);
-    const help=document.createElement("div");help.id="nc-observer-help";
-    help.textContent="Move: WASD / arrows · Shift: faster · C: camera";
-    help.style.cssText="margin-top:7px;font-size:11px;color:#a7f3d0";panel.appendChild(help);
-    document.body.appendChild(panel);
+    const chat=document.getElementById("chat-block");
+    if(!chat || document.getElementById("nc-spectator-chat-status"))return;
+    const status=document.createElement("div");
+    status.id="nc-spectator-chat-status";
+    status.style.cssText="display:none;font:11px Arial;color:#a7f3d0;margin-top:3px;pointer-events:none";
+    status.textContent="Press T to chat with players";
+    chat.appendChild(status);
+    for(const type of ["mousedown","mouseup","click"])win.addEventListener(type,event=>{
+      if(spectatorChatWatching && spectatorChatSocket?.readyState===1 && event.target?.id==="chat-input")event.stopImmediatePropagation();
+    },true);
   }
 
   function receiveSpectatorChat(bytes) {
     if(bytes[1]===4){confirmSpectatorMessage();return;}
-    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("Please wait one second, then press Send again.");return;}
+    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("Please wait one second, then press Enter again.");return;}
     if (bytes[1] === 0) {
       spectatorChatSupported = true;
-      setChatStatus(spectatorChatWatching ? "Same match · Enter or Send" : "Same match · Reply using normal game chat");
-      const history = document.getElementById("nc-spectator-chat-history");
-      if (history) history.textContent = "";
+      setChatStatus((observerMovement ? "Move: mouse or WASD/arrows · T: chat" : "Press T to chat with players · Enter to send"));
+      chatRows=[];
       subscribeSpectatorChat();
       return;
     }
@@ -311,15 +362,13 @@
     };
     const name = read(), message = read();
     if(name===String(document.getElementById("username")?.value || "").slice(0,12))confirmSpectatorMessage();
-    const history = document.getElementById("nc-spectator-chat-history");
-    if (!history) return;
+
     const row = document.createElement("div"), label = document.createElement("strong"), body = document.createElement("span");
+    row.className="nc-spectator-message";
     label.style.color = "#6ee7a0";
     label.textContent = name + " [Spectator]: ";
     body.textContent = message;
-    row.appendChild(label); row.appendChild(body); history.appendChild(row);
-    while (history.children.length > 40) history.children[0].remove();
-    history.scrollTop = history.scrollHeight;
+    row.appendChild(label); row.appendChild(body); appendMatchChat(row);
   }
   let pendingGameSocketIntent = null;
   let connectionAttemptActive = false;
@@ -754,7 +803,7 @@
         const savedCamera = win.localStorage.getItem("cameraFullScreen");
         const fullPitch = savedCamera === "1" ||
           (savedCamera === null && win.localStorage.getItem("initialCameraFullScreen") === "1");
-        spectatorFollowPending = inGameSpectatorSocket ? !fullPitch : fullPitch;
+        spectatorFollowPending = !inGameSpectatorSocket && fullPitch;
       } catch (_) {}
     }
     if (privateRoute) {
@@ -774,11 +823,10 @@
     if (isNitroSocket && socketIntent) {
       hostedMatchActive = true;
       spectatorChatSocket = socket;
-      observerMovement=false;observerKeys=0;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
+      observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
       spectatorChatWatching = spectatorSocket;
       spectatorChatSupported = false;
-      const chatHistory = document.getElementById("nc-spectator-chat-history");
-      if (chatHistory) chatHistory.textContent = "";
+      chatRows=[];clearTimeout(chatFadeTimer);
       let playerJoinSent = false;
       let matchEnded = false;
       let reconnectRefreshTimer = null;
@@ -837,7 +885,12 @@
             event.stopImmediatePropagation?.();
             if (inGameSpectatorSocket && bytes[1] === 2 && pendingObserverJoin) {
               observerSupported = true;
-              observerMovement=bytes[2]===1;
+              observerMovement=bytes[2]>=1;observerMouseSupported=bytes[2]>=2;
+              if(!observerMouseSupported) {
+                clearTimeout(observerCapabilityTimer);pendingObserverJoin=null;
+                win.alert("This server needs the latest server.mjs and a restart for mouse-controlled in-game spectators. Please ask the host to update it.");
+                socket.close();return;
+              }
               clearTimeout(observerCapabilityTimer);
               const join = pendingObserverJoin;
               pendingObserverJoin = null;
@@ -852,7 +905,17 @@
             clearInterval(reconnectRefreshTimer);
             try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
           }
+          if(bytes?.[0]===13 && spectatorChatSocket===socket) {
+            const previousChat=document.getElementById("chat-history")?.innerHTML;
+            setTimeout(()=>{
+              if(spectatorChatSocket!==socket || document.getElementById("chat-history")?.innerHTML===previousChat)return;
+              const row=document.getElementById("chat-history")?.lastElementChild;
+              if(row && !row.classList.contains("nc-spectator-message"))appendMatchChat(row);
+            });
+          }
           if(bytes?.[0]===7) {
+            observerSlot=bytes[2];
+            chatRows=[];clearTimeout(chatFadeTimer);
             installObserverSensors();
             const capture={index:0};controlBodyCapture=capture;
             setTimeout(()=>{if(controlBodyCapture===capture)controlBodyCapture=null;},0);
@@ -869,7 +932,7 @@
         clearTimeout(observerCapabilityTimer);
         pendingObserverJoin = null;
         if (spectatorChatSocket === socket) {
-          observerMovement=false;observerKeys=0;chatPending=false;clearTimeout(chatConfirmTimer);
+          observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);
           spectatorChatSocket = null;
           spectatorChatSupported = false;
           refreshSpectatorChat();
@@ -930,8 +993,22 @@
           delete marker.__nc4v4UnusedSlot;
         }
       };
+      let observerTexture=null;
+      const greenObserver = (sprite,marker) => {
+        if(!observerTexture) {
+          const canvas=document.createElement("canvas");canvas.width=64;canvas.height=64;
+          const ctx=canvas.getContext("2d");ctx.beginPath();ctx.arc(32,32,29,0,Math.PI*2);
+          ctx.fillStyle="#43d981";ctx.fill();ctx.lineWidth=4;ctx.strokeStyle="#166b3c";ctx.stroke();
+          observerTexture=win.PIXI.Texture.fromCanvas(canvas);
+        }
+        const width=sprite.width,height=sprite.height;
+        sprite.texture=observerTexture;sprite.tint=0xffffff;sprite.width=width;sprite.height=height;
+        sprite.__ncObserverSkin=true;
+        if(marker){marker.visible=false;marker.renderable=false;}
+      };
       const hideSpareSlots = (stage) => {
         if (!stage) return;
+        let playerIndex=0;
         const queue = [stage];
         while (queue.length) {
           const node = queue.shift();
@@ -954,6 +1031,8 @@
             const playerSized = typeof child?.width === "number" && typeof child?.height === "number" &&
               Math.abs(child.width - child.height) < 0.1 && child.width < 1.6;
             if (position && playerSized) {
+              if(observerMovement && playerIndex===observerSlot)observerSprite=child;
+              playerIndex++;
               const outsideArena = position.x < -20 || position.x > 120 || position.y < -20 || position.y > 80;
               if (outsideArena) {
                 hideForThisFrame(child);
@@ -968,6 +1047,7 @@
                 // An empty slot can become occupied after this client has
                 // already joined. Undo our old hidden state immediately.
                 restoreOccupiedSlot(child, children[index + 1]);
+                if(playerIndex===9 || playerIndex===10)greenObserver(child,children[index+1]);
               }
             }
             if (child?.children?.length) queue.push(child);
@@ -979,7 +1059,7 @@
         const originalRender = prototype.render;
         if (typeof originalRender !== "function" || originalRender.__nc4v4SpareWrapped) continue;
         const render = function (stage, ...args) {
-          if (hostedMatchActive) hideSpareSlots(stage);
+          if (hostedMatchActive) hideSpareSlots(stage);observerRenderer=this;
           return originalRender.call(this, stage, ...args);
         };
         render.__nc4v4SpareWrapped = true;
@@ -1037,7 +1117,12 @@
           win.jQuery?.(option)?.data?.("ping", shownPing);
           changed = true;
         }
-        const label = serverChoices[option.value].label + " (" + (option.dataset.players || "0") + ")";
+        const population=measuredServerPlayers.get(option.value);
+        const shownPopulation=population==null ? "?" : String(population);
+        if(option.dataset.players!==shownPopulation || String(win.jQuery?.(option)?.data?.("players"))!==shownPopulation) {
+          option.dataset.players=shownPopulation;win.jQuery?.(option)?.data?.("players",shownPopulation);changed=true;
+        }
+        const label = serverChoices[option.value].label + " (" + shownPopulation + ")";
         if (option.textContent !== label) { option.textContent = label; changed = true; }
       }
     }
@@ -1134,8 +1219,7 @@
         button.textContent = "In-game spectate";
         button.title = "Watch from outside the pitch. Two spaces per active public 4v4 match.";
         button.className=nativeSpectateButton.className;
-        button.style.cssText=nativeSpectateButton.style.cssText;
-        button.style.marginLeft="10px";
+        button.style.cssText="box-sizing:border-box!important;width:auto!important;min-width:0!important;max-width:90vw!important;height:auto!important;min-height:44px!important;padding:12px 20px!important;margin:10px!important;font:600 clamp(14px,2vw,22px)/1.25 Arial!important;white-space:nowrap!important;vertical-align:middle!important;border:1px solid #c2d0d0!important;border-radius:8px!important;background:#879e9b!important;color:white!important;box-shadow:0 4px 0 #627c78!important;cursor:pointer";
         button.addEventListener("click", () => {
           if (!hostedMode || partySocket?.readyState === 1) return;
           reconnectRequested = false;
@@ -1187,7 +1271,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.12.1";
+    badge.textContent = "HOSTED 4v4 v3.14.3";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
