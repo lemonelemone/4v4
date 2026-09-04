@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.17.0
+// @version      3.17.1
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -157,6 +157,10 @@
   let observerKeys = 0;
   let controlBodyCapture = null;
   let chatPending = false;
+  function closeMatchChat(){
+    const input=document.getElementById("chat-input");
+    if(input){input.value="";input.blur();input.disabled=true;input.style.display="none";}
+  }
   let consumedChatKey = null;
   let chatRows = [];
   let chatFadeTimer = null;
@@ -176,7 +180,7 @@
     sentChatText = message;
     chatPending=true;
     spectatorChatSocket.send(packet);
-    const input=document.getElementById("chat-input");if(input){input.value="";input.blur();}
+    closeMatchChat();
     setChatStatus("Sending…");
     clearTimeout(chatConfirmTimer);
     chatConfirmTimer=setTimeout(()=>{chatPending=false;restoreUnsentChat();setChatStatus("No delivery confirmation. Press T to try again.");},4000);
@@ -187,7 +191,7 @@
     chatPending=false; clearTimeout(chatConfirmTimer);
     const input=document.getElementById("chat-input");
     // Never clear a new draft when an earlier message is acknowledged.
-    setChatStatus("Sent");
+    setChatStatus("Sent · T to chat");
   }
   function sendObserverKeys() {
     if(!observerMovement || spectatorChatSocket?.readyState!==1)return;
@@ -215,7 +219,7 @@
       for(let i=0;i<message.length;i++)view.setUint16(2+i*2,message.charCodeAt(i));
       spectatorChatSocket.send(packet);
     }
-    const input=document.getElementById("chat-input");if(input){input.value="";input.blur();}
+    closeMatchChat();
   }
   // Chat owns game shortcuts and pointer controls until it is sent or cancelled.
   for(const type of ["pointerdown","pointerup","mousedown","mouseup","mousemove","click","wheel"])win.addEventListener(type,event=>{
@@ -243,10 +247,10 @@
           if(type==="keydown" && !event.repeat){
             consumedChatKey="Enter";
             if(input.value.trim())sendMatchChat(input.value);
-            else input.blur();
+            else closeMatchChat();
           }
         } else if(event.key==="Escape") {
-          event.preventDefault();consumedChatKey="Escape";input.value="";input.blur();
+          event.preventDefault();consumedChatKey="Escape";closeMatchChat();
           setChatStatus("Chat cancelled · T to chat");
         }
         else if(type==="keydown" && event.defaultPrevented && event.key?.length===1 && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing) {
@@ -259,8 +263,8 @@
       }
       if(!typing && (event.key?.toLowerCase()==="t" || event.key==="Enter")) {
         event.preventDefault();event.stopImmediatePropagation();
-        if(type==="keyup" && input) {
-          input.disabled=false;input.readOnly=false;
+        if(type==="keyup" && event.key?.toLowerCase()==="t" && input) {
+          input.disabled=false;input.readOnly=false;input.style.display="";
           const block=document.getElementById("chat-block");if(block)block.style.display="block";
           input.focus();
           const history=document.getElementById("chat-history");
@@ -909,7 +913,18 @@
         } catch (_) {}
         return nativeSend.call(this, data);
       };
-      socket.addEventListener("open", () => { connectionAttemptActive = false; nativeSend.call(socket,new Uint8Array([30])); });
+      let joinStatusTimer=null;
+      socket.addEventListener("open", () => {
+        connectionAttemptActive=false;nativeSend.call(socket,new Uint8Array([30]));
+        if(spectatorSocket){
+          const request=()=>{if(socket.readyState===1)nativeSend.call(socket,new Uint8Array([28,0]));};
+          request();joinStatusTimer=setInterval(request,3000);
+        }
+      });
+      socket.addEventListener("close",()=>{
+        clearInterval(joinStatusTimer);
+        if(spectatorChatSocket===socket){const input=document.getElementById("chat-input");if(input){input.disabled=false;input.style.display="";}}
+      });
       socket.addEventListener("message", (event) => {
         const { data } = event;
         try {
@@ -942,7 +957,7 @@
               nativeSend.call(socket, join);
               return;
             }
-            if (spectatorChatSocket === socket) {receiveSpectatorChat(bytes);if(bytes[1]===0 && spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));}
+            if (spectatorChatSocket === socket) {receiveSpectatorChat(bytes);}
             return;
           }
           if (!spectatorSocket && bytes?.[0] === 14) {
@@ -959,6 +974,7 @@
             });
           }
           if(bytes?.[0]===7) {
+            if(spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));
             observerSlot=bytes[2];
             chatRows=[];clearTimeout(chatFadeTimer);
             installObserverSensors();
@@ -1336,7 +1352,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.17.0";
+    badge.textContent = "HOSTED 4v4 v3.17.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

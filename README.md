@@ -1,6 +1,8 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.17.0**
+Current release version: **3.17.1**
+
+Version 3.17.1 closes and disables the chat input on sending/cancelling; only T reopens it. Join-status requests are independent of spectator chat, sent on connection/control assignment and retried every three seconds. Requires the existing server v3.16.0 or newer for Join this match (v3.17.0 for browser RTT); no new server changes in 3.17.1.
 
 Version 3.17.0 measures Tab ping with browser-echoed application packets, avoiding proxy heartbeat latency. Update both server.mjs (restart) and the userscript. Homepage counts refresh every ten seconds and the visible selected label is reconciled with fresh population data. A count includes connected players across matches on that server, excluding spectators. Localhost can legitimately measure 1 ms.
 
