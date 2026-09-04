@@ -1,6 +1,10 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.14.3**
+Current release version: **3.15.1**
+
+Version 3.15.1 changes spectator characters and spectator chat names to purple. This is a userscript-only colour update; server.mjs is unchanged from v3.15.0. All earlier fixes remain.
+
+Version 3.15.0 darkens spectator chat names, reduces In-game spectate button padding/font, and gives Reconnect a single blue fill without the native grey shadow. Two occupied spectator slots are green and arrowless for all updated userscript viewers, verified with two spectators and a player. Stock/older clients need the updated userscript for these visuals. Ghost positions are clamped to x=5..95 and y=-6..62, retaining a small margin around the pitch. Goals with no recent active scoring-team touch are now uncredited (255), instead of assigning a potentially empty player slot that makes the native replay camera follow an off-map parked player. Such goals still count for the correct team, with no invented player goal award. Active-player scoring credit remains. Server.mjs must be replaced and restarted for bounds and replay fix, and viewers must update the userscript. No deployment performed.
 
 Version 3.14.3 removes the automatic full-pitch toggle on in-game spectator entry, retaining the native saved camera mode and fixed zoom from the first view. Normal spectator follow behavior is unchanged. Hosted game chat now takes keyboard and game-pointer priority for players and spectators: Tab stays in chat, camera/movement/scoreboard shortcuts and wheel zoom are blocked while typing, Enter sends, and Escape cancels. Editing keys remain usable. Server code is unchanged from v3.14.2; install the updated userscript and refresh, with no additional host update needed. If an older script already saved fullscreen as your preference, choose your preferred camera once with C/X and zoom; subsequent in-game spectator joins retain it.
 

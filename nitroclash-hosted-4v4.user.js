@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.14.3
+// @version      3.15.1
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -365,7 +365,7 @@
 
     const row = document.createElement("div"), label = document.createElement("strong"), body = document.createElement("span");
     row.className="nc-spectator-message";
-    label.style.color = "#6ee7a0";
+    label.style.color = "#8b46bb";
     label.textContent = name + " [Spectator]: ";
     body.textContent = message;
     row.appendChild(label); row.appendChild(body); appendMatchChat(row);
@@ -998,7 +998,7 @@
         if(!observerTexture) {
           const canvas=document.createElement("canvas");canvas.width=64;canvas.height=64;
           const ctx=canvas.getContext("2d");ctx.beginPath();ctx.arc(32,32,29,0,Math.PI*2);
-          ctx.fillStyle="#43d981";ctx.fill();ctx.lineWidth=4;ctx.strokeStyle="#166b3c";ctx.stroke();
+          ctx.fillStyle="#a663d4";ctx.fill();ctx.lineWidth=4;ctx.strokeStyle="#61338a";ctx.stroke();
           observerTexture=win.PIXI.Texture.fromCanvas(canvas);
         }
         const width=sprite.width,height=sprite.height;
@@ -1156,11 +1156,12 @@
       const button = document.createElement("button");
       button.id = `nc-local-4v4-reconnect-${suffix}`;
       button.type = "button";
-      button.className = "button";
+      button.className = "nc-reconnect-button";
+      button.style.cssText="box-sizing:border-box;background:#5488c4;color:#fff;border:0;border-radius:5px;box-shadow:none;font:600 13px/1.25 Arial;cursor:pointer;vertical-align:middle";
       button.textContent = "Reconnect";
       button.title = "Try to rejoin your previous 4v4 match within 60 seconds";
       Object.assign(button.style, suffix === "home"
-        ? { display: "inline-block", margin: "10px 0 0 10px", padding: "10px 24px" }
+        ? { display: "inline-block", margin: "10px 0 0 10px", padding: "6px 12px" }
         : { display: "block", margin: "18px auto 0", padding: "10px 24px" });
       button.addEventListener("click", () => {
         if (connectionAttemptActive || !readReconnectSession()) return;
@@ -1219,7 +1220,7 @@
         button.textContent = "In-game spectate";
         button.title = "Watch from outside the pitch. Two spaces per active public 4v4 match.";
         button.className=nativeSpectateButton.className;
-        button.style.cssText="box-sizing:border-box!important;width:auto!important;min-width:0!important;max-width:90vw!important;height:auto!important;min-height:44px!important;padding:12px 20px!important;margin:10px!important;font:600 clamp(14px,2vw,22px)/1.25 Arial!important;white-space:nowrap!important;vertical-align:middle!important;border:1px solid #c2d0d0!important;border-radius:8px!important;background:#879e9b!important;color:white!important;box-shadow:0 4px 0 #627c78!important;cursor:pointer";
+        button.style.cssText="box-sizing:border-box!important;width:auto!important;min-width:0!important;max-width:90vw!important;height:auto!important;min-height:28px!important;padding:6px 10px!important;margin:6px!important;font:600 13px/1.25 Arial!important;white-space:nowrap!important;vertical-align:middle!important;border:1px solid #c2d0d0!important;border-radius:8px!important;background:#879e9b!important;color:white!important;box-shadow:0 4px 0 #627c78!important;cursor:pointer";
         button.addEventListener("click", () => {
           if (!hostedMode || partySocket?.readyState === 1) return;
           reconnectRequested = false;
@@ -1271,7 +1272,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.14.3";
+    badge.textContent = "HOSTED 4v4 v3.15.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

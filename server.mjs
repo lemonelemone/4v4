@@ -452,7 +452,7 @@ function recordGoal(world, goal) {
     const overtimeAward = awardPoints(world, goal.scorer, ACTION.OVERTIME_GOAL);
     if (overtimeAward) packets.push(overtimeAward);
   }
-  if (world.stats[goal.scorer].goals === 3) {
+  if (world.stats[goal.scorer]?.goals === 3) {
     const hatTrickAward = awardPoints(world, goal.scorer, ACTION.HAT_TRICK);
     if (hatTrickAward) packets.push(hatTrickAward);
   }
@@ -528,8 +528,8 @@ function detectGoal(world) {
   if (ball.x <= 7.8125) team = 1;
   else if (ball.x >= 92.1875) team = 0;
   else return null;
-  const recent = world.touches.filter((touch) => touch.slot % 2 === team && Date.now() - touch.time <= 15000);
-  const scorer = recent.length ? recent[recent.length - 1].slot : team;
+  const recent = world.touches.filter((touch) => touch.slot % 2 === team && !HIDDEN_SLOTS.has(touch.slot) && world.players[touch.slot]?.body?.isActive() && Date.now() - touch.time <= 15000);
+  const scorer = recent.length ? recent[recent.length - 1].slot : 255;
   const scoringTouch = recent.length ? recent[recent.length - 1] : null;
   let assist = 255;
   for (let index = recent.length - 2; index >= 0; index--) {
@@ -983,7 +983,7 @@ function runArenaTick(arena) {
           for (const action of goalActions) arenaSend(arena, action);
           arenaSend(arena, arenaStatsPacket(arena));
           const assistText = goal.assist === 255 ? "no assist" : `assisted by slot ${goal.assist + 1}`;
-          console.log(`Arena ${arena.id}: ${goal.team === 0 ? "Blue" : "Red"} goal — scored by slot ${goal.scorer + 1}, ${assistText}`);
+          console.log(`Arena ${arena.id}: ${goal.team === 0 ? "Blue" : "Red"} goal — ${goal.scorer === 255 ? "uncredited scorer" : `scored by slot ${goal.scorer + 1}`}, ${assistText}`);
           if (arena.world.overtime) {
             finishArena(arena);
           } else {
@@ -1441,8 +1441,8 @@ function moveInGameSpectators(arena) {
     if (!dx && !dy) continue;
     const player = arena.world.players[watcher.slot];
     const distance = (keys & 16 ? 24 : 12) / PHYSICS_HZ / (mouse ? 1 : Math.hypot(dx, dy));
-    player.x = Math.max(-15, Math.min(115, player.x + dx * distance));
-    player.y = Math.max(-15, Math.min(75, player.y + dy * distance));
+    player.x = Math.max(5, Math.min(95, player.x + dx * distance));
+    player.y = Math.max(-6, Math.min(62, player.y + dy * distance));
     player.angle = Math.atan2(dy, dx);
   }
 }
