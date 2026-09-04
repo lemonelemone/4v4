@@ -1,6 +1,20 @@
 # NitroClash hosted 4v4
 
-Current userscript version: **3.7.2**
+Current release version: **3.12.1**
+
+Version 3.12.1 makes in-game spectators movable with WASD or arrow keys (Shift for faster movement). They spawn outside the pitch and can move through the background and pitch without colliding with players, walls or the ball. The competitive physics remain unchanged. Chat input is shielded from game keyboard handlers, includes a Send button, and keeps unsent text until delivery is confirmed or explains a failure. In-game spectate matches the native Spectate button, and 4 vs 4 has matching spacing and capitalization. This release needs the updated server for observer movement and chat acknowledgements, plus the updated userscript. Nothing has been deployed.
+
+Version 3.11.0 adds **In-game spectate** alongside ordinary Spectate on the hosted 4v4 homepage. It joins an existing public match using one of two spare positions outside the pitch, with a full-pitch camera by default. The eight competitive slots are unchanged. Observers have no server physics bodies and cannot touch the ball, vote to skip replays or vote for rematches. They can use spectator chat, remain through a rematch if players stay, and release their observer place immediately on disconnect. If the busiest match has no observer place, another active public match is tried. No private match is selected and no new match is created just for an observer. The button is unavailable in parties and other modes. Ordinary Spectate remains separate and does not use these two places. A capability check blocks entry on older backends before any join is sent.
+
+Hosted dropdown pings now use the median of three real WebSocket round trips, refreshed every 15 seconds while on the homepage. The native dropdown's attribute and jQuery cache are both updated; measuring/unavailable is shown instead of an invented number. These are estimates and can differ from in-match latency as network conditions change. Tab pings are measured by server WebSocket ping/pong, smoothed and refreshed during matches, rather than the previous fixed 1. Empty, not-yet-measured or stale entries show 0.
+
+Version 3.10.0 fixes accumulating spectator nametags when switching arenas and the spectator's name replacing the followed player's name. Switching when only one public arena exists is now a no-op. Spectate intent is bound to the game reservation so a latency probe cannot consume it.
+
+**Spectator chat (4v4)** is an on/off checkbox on the homepage, enabled by default and saved in this browser. Spectators type in the bottom-right Spectator chat box and press Enter or click Send. Their names appear in green with a [Spectator] label. Players with this version can read these messages and reply through normal game chat, which spectators already receive. Turning the checkbox off disables sending and receiving spectator chat and clears its local history. Messages follow the current public arena only; switching arenas clears the panel. No player slots are allocated to chat users. Messages are limited to 255 characters, one per second, and the panel retains at most 40 messages.
+
+Spectator chat is currently limited to hosted 4v4. The original servers are not controlled by this project, and no reliable shared match identifier was found in the inspected client protocol for attaching a separate chat relay. Original modes and their existing chat remain unchanged. Both the userscript and server need this release; on an older backend the chat panel explains that a server update is needed.
+
+Version 3.9.1 fixes the ten seconds lost after goals: the next kickoff resumes at the exact goal time, whether the replay finishes or is skipped. Kickoff countdowns remain paused. Regulation and overtime exclude celebration/replay time, while downloaded replay frames and events retain a continuous timeline. This fix requires updating server.mjs and restarting each hosted backend; installing the userscript alone does not update the server. No deployment has been performed as part of packaging this release.
 
 This is an early multiplayer compatibility server, not a finished public deployment. It implements the stock NitroClash WebSocket handshake, puts up to eight browsers into a shared arena, runs a Planck/Box2D physics world at 60 Hz, and emits authoritative state frames at 30 Hz.
 
@@ -16,7 +30,7 @@ Goals trigger the stock explosion, a controllable three-second celebration, a fi
 
 At the end of regulation, a leading team wins immediately. A tied game resets to one overtime kickoff and the next goal ends the match. The stock results screen receives the final score, player goals, assists, saves, points and MVP selection.
 
-The stock Tab scoreboard is refreshed once per second and after every scoring event. Connected browser players report a small nonzero development ping; empty slots report 0 ms. Account levels/ranks are 0 because this server has no NitroClash account database.
+The stock Tab scoreboard is refreshed once per second and after every scoring event. Connected players and in-game observers report measured round-trip ping; empty, not-yet-measured or stale slots report 0. Account levels/ranks are 0 because this server has no NitroClash account database.
 
 Point values match the game's action protocol:
 
@@ -40,15 +54,15 @@ Every kickoff randomly selects four of the five official 5v5 spawn-pad pairs. Bl
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.7.2** badge appears on the homepage.
-5. Leave the server set to **Europe**.
-6. Choose the mode that is labelled **4v4** (it was originally the 5v5 button), then click Play.
+4. Confirm that the orange **HOSTED 4v4 v3.11.0** badge appears on the homepage.
+5. For hosted **4 VS 4**, choose **Europe** (VPS) or **Europe 2** (Render). Choose **1 VS 1**, **2 VS 2**, **3 VS 3**, **5 VS 5** or **Classic** for NitroClash's original servers. **Train** remains the original local training mode. Mode changes update the server list immediately, without refreshing.
+6. Choose your mode, then click Play. The separate **4 VS 4** and **5 VS 5** buttons remain available throughout.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
 
-For a private test, create a party using NitroClash's normal **Create party** button, share its `#XXXXXX` link, arrange Team 1/Team 2, choose 4v4, tick **Private game**, and start normally. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
+For linked games, everyone should install **v3.9.0 or later**. Create/join a party and let the host choose the mode and server. Members follow the host's live selection without refreshing—even from hosted 4v4 to original 3v3, or from original 5v5 back to hosted 4v4. In hosted 4v4, all members press Play to mark themselves ready; the match starts when everyone is ready. Arrange Team 1/Team 2: **Team 1 is blue; Team 2 is red**. Hosted linked parties are isolated by party code even when **Private game** is not ticked. Use unique names within the party; ambiguous names are rejected instead of silently assigning the wrong side. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
 
-The userscript answers NitroClash's server-list and reservation requests with native in-page blob responses. **Europe** redirects game sockets to `wss://nitroclashio.duckdns.org` and is the only hosted 4v4 server choice. Play, private games, spectating and reconnecting all use that endpoint. Joining therefore no longer depends on NitroClash's public game matchmaking endpoint. Other unrelated website requests are left alone.
+The userscript merges NitroClash's live official server list with separate hosted region tags. **Europe** sends hosted 4v4 to `wss://nitroclashio.duckdns.org`; **Europe 2** uses `wss://fourv4-s2fb.onrender.com`. Original modes retain their official matchmaking reservations and game addresses. The position-based spare-player filter runs only for hosted games. Hosted linked games use the official party lobby only to exchange names, sides, mode and readiness; their match traffic and physics go to the selected hosted backend. Original modes and the party lobby still depend on NitroClash's services being available. Never mix this userscript with another server redirector.
 
 ## Current limitations
 
@@ -72,4 +86,32 @@ The userscript answers NitroClash's server-list and reservation requests with na
 
 ## Return to normal NitroClash
 
-Disable the hosted userscript to return NitroClash to its normal servers.
+Choose an original mode (1v1, 2v2, 3v3, 5v5 or Classic) without refreshing. Alternatively, disable the userscript and reload for the completely unmodified website.
+
+## Version 3.8.0
+
+- Restores the Render endpoint as **Europe 2**, secondary to **Europe**.
+- Adds an original **5 VS 5** button alongside hosted **4 VS 4**. Other original modes reload into the original frontend network path; official availability still depends on NitroClash.
+- Captures party roster sides and the selected server before the stock client clears the party hash at match start. Team 1 maps to blue (even slots), Team 2 to red (odd slots), regardless of connection order.
+- Gives every hosted party member a separate persistent tab reservation key. Unidentifiable/duplicate party names fail clearly instead of assigning a random team.
+- Both userscripts now share the same routing/reconnect logic. Keep only one enabled.
+- This release changes userscripts/documentation only. The VPS backend is unchanged and does not need restarting. Pushing to GitHub updates the userscript download; a configured Render auto-deploy can still restart that service and disconnect its matches.
+
+## Version 3.9.0 — seamless modes and host following
+
+- Switch among all original modes and hosted 4v4 on the same page. No mode-switch reloads.
+- Party members follow the host's authoritative mode and region updates, including the distinction between hosted 4v4 and original 5v5.
+- Hosted party readiness starts the party-code arena directly, without allocating an original game. Repeated ready updates cannot create duplicate starts.
+- Preserves Team 1 = blue / Team 2 = red, separate tab identities, both hosted endpoints, spectator routing and reconnect records (including older saved region names).
+- Hosted 4v4 now matches the original mode-button styling; only the actual selected mode is highlighted.
+- Regression checks: two real stock browser clients followed all competitive modes and joined original 3v3 and hosted 4v4, receiving live state; tested both hosted team sides, endpoint switching, ready gating and single-start routing. Automated spare-slot, reconnect/spectator, chat/change-team and rematch checks are included in the development workspace.
+- This is a userscript-only runtime update: **no VPS backend restart is needed**.
+
+### Publish this release
+
+1. Extract `nitroclash-github-update-v3.9.0.zip`.
+2. Replace its three files in your GitHub Desktop `4v4` folder: `server.mjs`, `README.md`, and `nitroclash-hosted-4v4.user.js`.
+3. **Commit to main**, then **Push origin**. The ZIP includes the unchanged backend for the normal release workflow.
+4. A configured Render auto-deploy may restart Europe 2 and disconnect matches in progress. The Europe VPS needs no restart for this release.
+5. In Tampermonkey, use **Check for userscript updates**, then reload NitroClash once to load the new script. After this initial installation reload, mode changes require no refresh.
+6. Confirm **HOSTED 4v4 v3.9.0** on the homepage. Everyone in a hosted party must update.

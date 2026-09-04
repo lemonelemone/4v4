@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.7.2
+// @version      3.12.1
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -10,19 +10,70 @@
 // @match        *://www.nitroclash.io/*
 // @grant        unsafeWindow
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 (function () {
   "use strict";
   const win = unsafeWindow;
+  if (win.top !== win.self) return;
+  const initialUrl = new URL(win.location.href);
+  let hostedMode = initialUrl.searchParams.get("ncMode") !== "official";
+  let selectedMode = hostedMode ? 4 : Number(initialUrl.searchParams.get("ncGameMode") ?? 4);
+  if (!Number.isInteger(selectedMode) || selectedMode < 0 || selectedMode > 5) selectedMode = 4;
   const NativeWebSocket = win.WebSocket;
   const NativeXMLHttpRequest = win.XMLHttpRequest;
-  const defaultServerCode = "EU1";
+  const nativeXhrOpen = NativeXMLHttpRequest.prototype.open;
+  let partySocket = null;
+  let partyIsHost = true;
+  let partyRegion = null;
+  let hostedMatchActive = false;
+  let preferredHostedRegion = "NC4EU";
+  let preferredOfficialRegion = "EU1";
+  let stockSelectMode = null;
+  function changeNetworkMode(official, mode = 4) {
+    if (partySocket?.readyState === 1 && !partyIsHost) return;
+    if (document.getElementById("play-button")?.disabled) return;
+    hostedMode = !official;
+    hostedMatchActive = false;
+    selectedMode = mode;
+    partyRegion = null;
+    // The stock lobby sends its current region with mode changes. Select the
+    // right region BEFORE calling it; its roster echo remains authoritative.
+    const select = document.getElementById("server");
+    if (select) {
+      const code = hostedMode ? preferredHostedRegion : preferredOfficialRegion;
+      if (![...select.options].some(option => option.value === code)) {
+        const option = document.createElement("option");
+        option.value = code;
+        option.textContent = serverChoices[code]?.label || code;
+        select.appendChild(option);
+      }
+      select.value = code;
+    }
+    (stockSelectMode || win.nitroclash?.selectMode)?.call(win.nitroclash, mode);
+    refreshModeControls();
+  }
+  document.addEventListener?.("click", (event) => {
+    const button = event.target.closest?.('[id^="gamemode-"]');
+    if (!button) return;
+    const mode = Number(button.id.replace("gamemode-", ""));
+    if (!Number.isInteger(mode) || mode < 0 || mode > 5) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    changeNetworkMode(true, mode);
+  }, true);
+  const defaultServerCode = "NC4EU";
   const serverChoices = Object.freeze({
-    EU1: Object.freeze({
+    NC4EU: Object.freeze({
       label: "Europe",
-      fakeUri: "eu6.nitroclash.io:8003",
+      fakeUri: "nc-europe.nitroclash.io:8003",
       url: "wss://nitroclashio.duckdns.org",
+    }),
+    NC4OLD: Object.freeze({
+      label: "Europe 2",
+      fakeUri: "nc-old.nitroclash.io:8003",
+      url: "wss://fourv4-s2fb.onrender.com",
     }),
   });
   const serverListResponse = Object.fromEntries(Object.entries(serverChoices).map(([code, choice]) => [
@@ -31,7 +82,7 @@
   ]));
   const selectedServerCode = () => {
     const code = String(document.getElementById("server")?.value || "");
-    return serverChoices[code] ? code : defaultServerCode;
+    return serverChoices[code] ? code : preferredHostedRegion;
   };
   const serverCodeForSocketUrl = (url) => {
     try {
@@ -40,15 +91,242 @@
         choice.fakeUri.split(":", 1)[0].toLowerCase() === hostname);
       if (match) return match[0];
     } catch (_) {}
-    return selectedServerCode();
+    return null;
   };
   const reconnectStorageName = "nc4v4-reconnect-session";
   let reconnectRequested = false;
   let spectateRequested = false;
+  let inGameSpectateRequested = false;
+  let launchingInGameSpectate = false;
+  const measuredServerPings = new Map();
+  let nextPingRefresh = 0;
+
+  function refreshMeasuredPings() {
+    const home = document.getElementById("homepage");
+    if (!home || home.style.display === "none" || (win.getComputedStyle && win.getComputedStyle(home).display === "none") || Date.now() < nextPingRefresh) return;
+    nextPingRefresh = Date.now() + 15000;
+    for (const [code, choice] of Object.entries(serverChoices)) {
+      const samples = [];
+      let socket, sentAt = 0, finished = false;
+      const now = () => win.performance?.now?.() ?? Date.now();
+      const finish = value => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        measuredServerPings.set(code, value);
+        try { socket?.close(); } catch (_) {}
+        refreshModeControls();
+      };
+      const timeout = setTimeout(() => finish(null), 8000);
+      const send = () => { if (!finished && socket.readyState === 1) { sentAt = now(); socket.send(new Uint8Array([99])); } };
+      try {
+        socket = new NativeWebSocket(choice.url);
+        socket.binaryType = "arraybuffer";
+        socket.addEventListener("open", send);
+        socket.addEventListener("message", ({ data }) => {
+          const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          if (finished || bytes?.[0] !== 99) return;
+          samples.push(Math.max(1, now() - sentAt));
+          if (samples.length === 3) finish(Math.round(samples.sort((a,b) => a-b)[1]));
+          else setTimeout(send, 50);
+        });
+        socket.addEventListener("error", () => finish(null));
+        socket.addEventListener("close", () => { if (!finished) finish(null); });
+      } catch (_) { finish(null); }
+    }
+  }
+  let spectatorChatSocket = null;
+  let spectatorChatSupported = false;
+  let spectatorChatWatching = false;
+  let observerMovement = false;
+  let observerKeys = 0;
+  let controlBodyCapture = null;
+  let chatPending = false;
+  let chatConfirmTimer = null;
+  const setChatStatus = text => { const el = document.getElementById("nc-spectator-chat-status"); if (el) el.textContent = text; };
+  function sendSpectatorMessage(text) {
+    const message = String(text || "").trim().slice(0,255);
+    if (!message || chatPending) return;
+    if (!spectatorChatEnabled || !spectatorChatSupported || spectatorChatSocket?.readyState !== 1) {
+      setChatStatus("Chat unavailable: enable spectator chat and check the server version."); return;
+    }
+    const packet = new Uint8Array(3 + message.length * 2);
+    packet[0]=26; packet[1]=1; packet[2]=message.length;
+    const view=new DataView(packet.buffer);
+    for(let i=0;i<message.length;i++)view.setUint16(3+i*2,message.charCodeAt(i));
+    chatPending=true;
+    spectatorChatSocket.send(packet);
+    setChatStatus("Sending…");
+    clearTimeout(chatConfirmTimer);
+    chatConfirmTimer=setTimeout(()=>{chatPending=false;setChatStatus("No confirmation received. Your text is kept; try Send again.");},4000);
+  }
+  function confirmSpectatorMessage() {
+    if (!chatPending) return;
+    chatPending=false; clearTimeout(chatConfirmTimer);
+    const input=document.getElementById("nc-spectator-chat-input"); if(input)input.value="";
+    setChatStatus("Sent");
+  }
+  function sendObserverKeys() {
+    if (observerMovement && spectatorChatSocket?.readyState===1) spectatorChatSocket.send(new Uint8Array([27,observerKeys]));
+  }
+  // Capture before the game's keyboard handlers, preserving normal text input.
+  for(const type of ["keydown","keyup","keypress"]) win.addEventListener(type,event=>{
+    if(event.target?.id === "nc-spectator-chat-input") {
+      event.stopImmediatePropagation();
+      if(type==="keydown" && event.key==="Enter") {event.preventDefault();sendSpectatorMessage(event.target.value);}
+      return;
+    }
+    if(!observerMovement || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "") || event.target?.isContentEditable) return;
+    const bit=({w:1,ArrowUp:1,s:2,ArrowDown:2,a:4,ArrowLeft:4,d:8,ArrowRight:8,Shift:16})[event.key?.length===1?event.key.toLowerCase():event.key];
+    if(!bit)return;
+    event.preventDefault();event.stopImmediatePropagation();
+    if(type==="keydown")observerKeys|=bit;
+    if(type==="keyup")observerKeys&=~bit;
+    sendObserverKeys();
+  },true);
+  win.addEventListener("blur",()=>{observerKeys=0;sendObserverKeys();});
+  document.addEventListener?.("focusin",event=>{if(/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "")){observerKeys=0;sendObserverKeys();}});
+  setInterval(sendObserverKeys,250);
+  function installObserverSensors() {
+    const prototype=win.planck?.Body?.prototype;
+    if(!prototype?.setTransform || prototype.setTransform.__ncObserverSensors)return;
+    const original=prototype.setTransform;
+    const transform=function(...args){
+      if(controlBodyCapture && controlBodyCapture.index<10) {
+        const slot=controlBodyCapture.index++;
+        if(slot>=8)for(let f=this.getFixtureList();f;f=f.getNext())f.setSensor(true);
+      }
+      return original.apply(this,args);
+    };
+    transform.__ncObserverSensors=true;prototype.setTransform=transform;
+  }
+  let spectatorChatEnabled = true;
+  try { spectatorChatEnabled = win.localStorage.getItem("nc4v4-spectator-chat") !== "off"; } catch (_) {}
+
+  function refreshSpectatorChat() {
+    const home = document.getElementById("homepage");
+    const atHome = home && home.style.display !== "none" &&
+      (!win.getComputedStyle || win.getComputedStyle(home).display !== "none");
+    const panel = document.getElementById("nc-spectator-chat");
+    if (!panel) return;
+    panel.style.display = spectatorChatEnabled && spectatorChatSocket?.readyState === 1 && !atHome ? "block" : "none";
+    const input = document.getElementById("nc-spectator-chat-input");
+    input.style.display = spectatorChatWatching ? "block" : "none";
+    input.disabled = !spectatorChatSupported;
+    document.getElementById("nc-spectator-chat-send").style.display = spectatorChatWatching ? "block" : "none";
+    document.getElementById("nc-observer-help").style.display = observerMovement ? "block" : "none";
+    if (!document.getElementById("nc-spectator-chat-status").textContent) document.getElementById("nc-spectator-chat-status").textContent = !spectatorChatSupported
+      ? "Spectator chat needs the updated 4v4 server."
+      : spectatorChatWatching ? "Same match · Enter to send" : "Same match · Reply using normal game chat";
+  }
+
+  function subscribeSpectatorChat() {
+    if (spectatorChatSupported && spectatorChatSocket?.readyState === 1)
+      spectatorChatSocket.send(new Uint8Array([26, 0, spectatorChatEnabled ? 1 : 0]));
+    refreshSpectatorChat();
+  }
+
+  function installSpectatorChat() {
+    const home = document.getElementById("homepage-loaded");
+    if (home && !document.getElementById("nc-spectator-chat-toggle")) {
+      const label = document.createElement("label");
+      label.style.cssText = "display:block;margin:8px;color:#a7f3d0;font:14px Arial";
+      const toggle = document.createElement("input");
+      toggle.id = "nc-spectator-chat-toggle";
+      toggle.type = "checkbox";
+      toggle.checked = spectatorChatEnabled;
+      toggle.addEventListener("change", () => {
+        spectatorChatEnabled = toggle.checked;
+        try { win.localStorage.setItem("nc4v4-spectator-chat", spectatorChatEnabled ? "on" : "off"); } catch (_) {}
+        const history = document.getElementById("nc-spectator-chat-history");
+        if (history) history.textContent = "";
+        subscribeSpectatorChat();
+      });
+      label.appendChild(toggle);
+      const caption = document.createElement("span");
+      caption.textContent = " Spectator chat (4v4)";
+      label.appendChild(caption);
+      home.appendChild(label);
+    }
+    if (!document.body || document.getElementById("nc-spectator-chat")) return;
+    const panel = document.createElement("section");
+    panel.id = "nc-spectator-chat";
+    panel.style.cssText = "display:none;position:fixed;right:12px;bottom:16px;width:290px;max-width:40vw;padding:10px;background:rgba(0,0,0,.78);color:#fff;border:1px solid #398568;border-radius:5px;z-index:10000;font:13px Arial";
+    const title = document.createElement("strong");
+    title.textContent = "Spectator chat";
+    panel.appendChild(title);
+    const history = document.createElement("div");
+    history.id = "nc-spectator-chat-history";
+    history.style.cssText = "max-height:150px;overflow-y:auto;overflow-wrap:anywhere;margin:6px 0";
+    panel.appendChild(history);
+    const status = document.createElement("div");
+    status.id = "nc-spectator-chat-status";
+    status.style.cssText = "font-size:11px;color:#ccc;margin:5px 0";
+    panel.appendChild(status);
+    const input = document.createElement("input");
+    input.id = "nc-spectator-chat-input";
+    input.type = "text";
+    input.maxLength = 255;
+    input.placeholder = "Message this match…";
+    input.setAttribute?.("aria-label", "Spectator message");
+    input.style.cssText = "box-sizing:border-box;width:100%;padding:6px;color:white;background:#222;border:1px solid #777";
+    for (const type of ["keydown", "keyup", "keypress", "mousedown", "mouseup", "click"])
+      input.addEventListener(type, event => {
+        event.stopPropagation();
+        if (type !== "keydown" || event.key !== "Enter") return;
+        event.preventDefault();
+        sendSpectatorMessage(input.value);
+      });
+    panel.appendChild(input);
+    const send=document.createElement("button");
+    send.id="nc-spectator-chat-send";send.type="button";send.textContent="Send";
+    send.style.cssText="margin-top:6px;width:100%;padding:6px;cursor:pointer";
+    send.addEventListener("click",event=>{event.preventDefault();event.stopPropagation();sendSpectatorMessage(input.value);});
+    panel.appendChild(send);
+    const help=document.createElement("div");help.id="nc-observer-help";
+    help.textContent="Move: WASD / arrows · Shift: faster · C: camera";
+    help.style.cssText="margin-top:7px;font-size:11px;color:#a7f3d0";panel.appendChild(help);
+    document.body.appendChild(panel);
+  }
+
+  function receiveSpectatorChat(bytes) {
+    if(bytes[1]===4){confirmSpectatorMessage();return;}
+    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("Please wait one second, then press Send again.");return;}
+    if (bytes[1] === 0) {
+      spectatorChatSupported = true;
+      setChatStatus(spectatorChatWatching ? "Same match · Enter or Send" : "Same match · Reply using normal game chat");
+      const history = document.getElementById("nc-spectator-chat-history");
+      if (history) history.textContent = "";
+      subscribeSpectatorChat();
+      return;
+    }
+    if (bytes[1] !== 1 || !spectatorChatEnabled) return;
+    let offset = 2;
+    const read = () => {
+      const length = bytes[offset++];
+      if (length === undefined || offset + length * 2 > bytes.length) throw new Error("Invalid chat packet");
+      let value = "";
+      for (let i = 0; i < length; i++, offset += 2) value += String.fromCharCode(bytes[offset] * 256 + bytes[offset + 1]);
+      return value;
+    };
+    const name = read(), message = read();
+    if(name===String(document.getElementById("username")?.value || "").slice(0,12))confirmSpectatorMessage();
+    const history = document.getElementById("nc-spectator-chat-history");
+    if (!history) return;
+    const row = document.createElement("div"), label = document.createElement("strong"), body = document.createElement("span");
+    label.style.color = "#6ee7a0";
+    label.textContent = name + " [Spectator]: ";
+    body.textContent = message;
+    row.appendChild(label); row.appendChild(body); history.appendChild(row);
+    while (history.children.length > 40) history.children[0].remove();
+    history.scrollTop = history.scrollHeight;
+  }
   let pendingGameSocketIntent = null;
   let connectionAttemptActive = false;
+  let pendingPartyRoute = null;
+  let pendingPartyServer = null;
   const captureGameSocketIntent = () => {
-    pendingGameSocketIntent = spectateRequested
+    pendingGameSocketIntent = inGameSpectateRequested ? "spectate-ingame" : spectateRequested
       ? "spectate-live"
       : reconnectRequested ? "reconnect" : "play";
   };
@@ -59,6 +337,9 @@
         win.localStorage.removeItem(reconnectStorageName);
         return null;
       }
+      // Migrate reconnect records created before the hosted regions were namespaced.
+      if (session.serverCode === "EU1") session.serverCode = "NC4EU";
+      if (session.serverCode === "USE1") session.serverCode = "NC4OLD";
       return session;
     } catch (_) { return null; }
   };
@@ -125,6 +406,27 @@
       });
     }
   });
+  // Keep the original region addresses and player counts alongside separate
+  // hosted aliases. Never substitute a hosted endpoint for an official region.
+  const officialServersReady = new Promise(resolve => {
+    const xhr = new NativeXMLHttpRequest();
+    const finish = () => {
+      try {
+        if (xhr.status === 200) Object.assign(serverListResponse, JSON.parse(xhr.responseText));
+      } catch (_) {}
+      resolve();
+    };
+    xhr.addEventListener("load", finish);
+    xhr.addEventListener("error", () => resolve());
+    xhr.addEventListener("timeout", () => resolve());
+    xhr.timeout = 8000;
+    nativeXhrOpen.call(xhr, "GET", "https://s.nitroclash.io/servers", true);
+    xhr.send();
+  });
+  function isHostedReservation(parsed) {
+    return parsed.searchParams.get("m") === "4" &&
+      (hostedMode || reconnectRequested);
+  }
   const reservationStorageName = "nc4v4-tab-reservation-key";
   function createReservationKey() {
     const random = new Uint32Array(1);
@@ -209,9 +511,11 @@
       const localHost = parsed && /^s\.nitroclash\.io$/i.test(parsed.hostname);
       const serverList = localHost && String(method).toUpperCase() === "GET" && parsed.pathname === "/servers";
       const reservation = localHost && String(method).toUpperCase() === "POST" && parsed.pathname === "/" &&
-        parsed.searchParams.has("r") && parsed.searchParams.has("m");
+        parsed.searchParams.has("r") && isHostedReservation(parsed);
       if (serverList || reservation) {
-        this._fake = { kind: serverList ? "servers" : "reservation", url: text, async: async !== false };
+        const requestedCode = parsed.searchParams.get("r");
+        this._fake = { kind: serverList ? "servers" : "reservation", url: text, async: async !== false,
+          code: serverChoices[requestedCode] ? requestedCode : selectedServerCode() };
         this._readyState = 1;
         this._emit("readystatechange");
         return;
@@ -230,7 +534,7 @@
         this._readyState = 4;
         this._responseText = this._fake.kind === "servers"
           ? JSON.stringify(serverListResponse)
-          : `${serverChoices[selectedServerCode()].fakeUri} ${reservationKey}`;
+          : `${serverChoices[this._fake.code].fakeUri} ${reservationKey}`;
         this._response = this._responseType === "json" ? JSON.parse(this._responseText) : this._responseText;
         this._emit("readystatechange");
         this._emit("load");
@@ -238,7 +542,7 @@
         console.log(`[nc-local-4v4] supplied local ${this._fake.kind} response`);
       };
       if (this._fake.kind === "servers") {
-        gameServerReady.then(finish, finish);
+        Promise.all([officialServersReady, gameServerReady]).then(finish, finish);
       } else if (this._fake.async) setTimeout(finish, 0);
       else finish();
     }
@@ -278,51 +582,123 @@
     Object.defineProperty(LocalXMLHttpRequest.prototype, name, { value });
   }
   win.XMLHttpRequest = LocalXMLHttpRequest;
-  // Prefer the browser's own XHR implementation and redirect only the two
-  // matchmaking calls to native same-origin blob responses. This avoids CORS,
-  // mixed-content and private-network checks before the actual game socket.
-  const localServersBlob = win.URL.createObjectURL(new win.Blob([
-    JSON.stringify(serverListResponse),
-  ], { type: "application/json" }));
-  let localReservationBlob = null;
-  const makeLocalReservationBlob = () => {
-    captureGameSocketIntent();
-    if (localReservationBlob) win.URL.revokeObjectURL(localReservationBlob);
-    localReservationBlob = win.URL.createObjectURL(new win.Blob([
-      `${serverChoices[selectedServerCode()].fakeUri} ${reservationKey}`,
-    ], { type: "text/plain" }));
-    return localReservationBlob;
-  };
-  const nativeXhrOpen = NativeXMLHttpRequest.prototype.open;
+  // The original client still requests HTTP matchmaking on an HTTPS page.
+  // Upgrade the transport without changing original regions or reservations.
   NativeXMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    let finalMethod = method;
-    let finalUrl = url;
+    let target = url;
     try {
       const parsed = new URL(String(url), win.location.href);
-      if (/^s\.nitroclash\.io$/i.test(parsed.hostname)) {
-        if (String(method).toUpperCase() === "GET" && parsed.pathname === "/servers") {
-          finalMethod = "GET";
-          finalUrl = localServersBlob;
-          console.log("[nc-local-4v4] supplied local server list");
-        } else if (String(method).toUpperCase() === "POST" && parsed.pathname === "/" &&
-          parsed.searchParams.has("r") && parsed.searchParams.has("m")) {
-          finalMethod = "GET";
-          finalUrl = makeLocalReservationBlob();
-          console.log("[nc-local-4v4] supplied local reservation");
-        }
+      if (parsed.hostname === "s.nitroclash.io" && parsed.protocol === "http:") {
+        parsed.protocol = "https:";
+        target = parsed.href;
       }
     } catch (_) {}
-    return nativeXhrOpen.call(this, finalMethod, finalUrl, ...rest);
+    return nativeXhrOpen.call(this, method, target, ...rest);
   };
-  // Keep the wrapper installed so the server-list response can wait for a
-  // sleeping free Render instance to wake before NitroClash opens its one-shot
-  // latency socket. The native prototype redirect above remains as a fallback
-  // for any library that cached the browser constructor before this script ran.
-  win.XMLHttpRequest = LocalXMLHttpRequest;
+  function trackPartySocket(socket) {
+    partySocket = socket;
+    partyIsHost = true;
+    partyRegion = null;
+    let name = "Player", code = "", rosterRoute = null, generation = 0, started = false;
+    socket.addEventListener("close", () => {
+      if (partySocket === socket) { partySocket = null; partyRegion = null; partyIsHost = true; }
+    });
+    const bytesOf = (data) => data instanceof ArrayBuffer ? new Uint8Array(data) :
+      ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+    const textAt = (bytes, offset) => {
+      const length = bytes[offset];
+      if (length === undefined || offset + 1 + length * 2 > bytes.length) throw new Error("Invalid party text");
+      let result = "";
+      for (let i = 0; i < length; i++) result += String.fromCharCode(bytes[offset + 1 + i * 2] * 256 + bytes[offset + 2 + i * 2]);
+      return result;
+    };
+    const send = socket.send;
+    socket.send = function (data) {
+      try {
+        const bytes = bytesOf(data);
+        if (bytes?.[0] === 2) name = textAt(bytes, 1) || "Player";
+        if (bytes?.[0] === 1) code = textAt(bytes, 1).toUpperCase();
+        if (bytes?.[0] === 4) {
+          // Stock latency updates may propose their fastest original region.
+          // Keep the explicitly selected network, including during party creation.
+          const requested = textAt(bytes, 2);
+          if (hostedMode && serverChoices[requested]) preferredHostedRegion = requested;
+          if (!hostedMode && requested && !serverChoices[requested]) preferredOfficialRegion = requested;
+          const region = hostedMode ? preferredHostedRegion : preferredOfficialRegion;
+          const packet = new Uint8Array(4 + region.length * 2);
+          packet[0] = 4;
+          packet[1] = hostedMode ? 4 : bytes[1];
+          packet[2] = region.length;
+          for (let i = 0; i < region.length; i++)
+            new DataView(packet.buffer).setUint16(3 + i * 2, region.charCodeAt(i));
+          packet[packet.length - 1] = bytes[bytes.length - 1];
+          data = packet.buffer;
+        }
+      } catch (_) {}
+      return send.call(this, data);
+    };
+    socket.addEventListener("message", ({ data }) => {
+      try {
+        const bytes = bytesOf(data);
+        if (bytes?.[0] === 1) {
+          let offset = 2;
+          const matches = [];
+          let everyoneReady = bytes[1] > 0;
+          for (let i = 0; i < bytes[1]; i++) {
+            everyoneReady = everyoneReady && bytes[offset + 2] === 1;
+            const player = textAt(bytes, offset + 3) || "Player";
+            if (player === name) matches.push(bytes[offset + 1]);
+            offset += 4 + bytes[offset + 3] * 2;
+          }
+          rosterRoute = /^[A-HJ-NP-Z0-9]{6}$/.test(code) ? {
+            partyCode: code,
+            team: matches.length === 1 && (matches[0] === 0 || matches[0] === 1) ? matches[0] : null,
+          } : null;
+          const revision = ++generation;
+          if (offset + 3 < bytes.length) {
+            const mode = bytes[offset];
+            const region = textAt(bytes, offset + 3);
+            partyIsHost = bytes[offset + 2] === 1;
+            if (mode !== 200 && region) {
+              selectedMode = mode;
+              hostedMode = mode === 4 && !!serverChoices[region];
+              if (!hostedMode) hostedMatchActive = false;
+              partyRegion = region;
+              if (hostedMode) preferredHostedRegion = region;
+              else preferredOfficialRegion = region;
+              // Run after the stock handler has applied the authoritative mode.
+              setTimeout(refreshModeControls, 0);
+              if (hostedMode && everyoneReady && !started) {
+                // The official lobby relays our region tag and ready flags,
+                // but cannot allocate hosted arenas. Start only after all
+                // members are ready, on the shared party-code arena.
+                setTimeout(() => {
+                  if (started || revision !== generation || socket.readyState !== 1) return;
+                  started = true;
+                  const uri = serverChoices[region].fakeUri;
+                  const packet = new Uint8Array(6 + uri.length * 2);
+                  packet[0] = 3;
+                  new DataView(packet.buffer).setInt32(1, reservationKey);
+                  packet[5] = uri.length;
+                  for (let i = 0; i < uri.length; i++)
+                    new DataView(packet.buffer).setUint16(6 + i * 2, uri.charCodeAt(i));
+                  socket.dispatchEvent(new win.MessageEvent("message", { data: packet.buffer }));
+                }, 0);
+              }
+            }
+          }
+        } else if (bytes?.[0] === 3) {
+          // This listener runs before the stock client clears the party hash.
+          pendingPartyRoute = hostedMode ? (rosterRoute || currentPrivatePartyRoute()) : null;
+          pendingPartyServer = hostedMode ? (partyRegion || selectedServerCode()) : null;
+        }
+      } catch (error) { console.warn("[nc4v4] Invalid party update", error); }
+    });
+    return socket;
+  }
   function currentPrivatePartyRoute() {
     const partyCode = String(win.location.hash || "").replace(/^#/, "").toUpperCase();
-    const privateGame = document.getElementById("private-game")?.checked === true;
-    if (!privateGame || !/^[A-HJ-NP-Z0-9]{6}$/.test(partyCode)) return null;
+    if (!/^[A-HJ-NP-Z0-9]{6}$/.test(partyCode)) return null;
 
     // The stock party socket renders the authoritative Team 1/Team 2 lists
     // before it starts every member's game connection. Preserve that choice
@@ -339,14 +715,21 @@
 
   function LocalWebSocket(url, protocols) {
     const text = String(url);
+    if (/\/team\/?(?:\?|$)/.test(new URL(text, win.location.href).pathname)) {
+      return trackPartySocket(protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols));
+    }
     const isNitroSocket = /^wss?:\/\/[^/]*nitroclash\.io(?::\d+)?\/\d+\/?$/i.test(text);
-    const pagePrivateRoute = isNitroSocket ? currentPrivatePartyRoute() : null;
+    const hostedAlias = serverCodeForSocketUrl(text);
+    // Official play, spectate and latency sockets keep their original URLs.
+    if (!hostedAlias && !pendingPartyServer) {
+      return protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+    }
+    const pagePrivateRoute = isNitroSocket ? (pendingPartyRoute ||
+      (pendingGameSocketIntent ? currentPrivatePartyRoute() : null)) : null;
     let socketIntent = null;
     if (isNitroSocket && pendingGameSocketIntent) {
       socketIntent = pendingGameSocketIntent;
       pendingGameSocketIntent = null;
-    } else if (isNitroSocket && spectateRequested) {
-      socketIntent = "spectate-live";
     } else if (isNitroSocket && reconnectRequested) {
       socketIntent = "reconnect";
     } else if (isNitroSocket && pagePrivateRoute) {
@@ -355,47 +738,86 @@
       socketIntent = "play";
     }
     const reconnectSocket = socketIntent === "reconnect";
-    const spectatorSocket = socketIntent === "spectate-live";
+    const inGameSpectatorSocket = socketIntent === "spectate-ingame";
+    const spectatorSocket = socketIntent === "spectate-live" || inGameSpectatorSocket;
     const savedReconnect = reconnectSocket ? readReconnectSession() : null;
-    const requestedServerCode = isNitroSocket ? serverCodeForSocketUrl(text) : defaultServerCode;
+    const requestedServerCode = pendingPartyServer || (isNitroSocket ? serverCodeForSocketUrl(text) : defaultServerCode);
     const gameServerCode = reconnectSocket && serverChoices[savedReconnect?.serverCode]
       ? savedReconnect.serverCode
       : requestedServerCode;
     const gameServerUrl = serverChoices[gameServerCode].url;
     let finalUrl = isNitroSocket ? gameServerUrl : url;
-    const privateRoute = isNitroSocket ? (savedReconnect?.kind === "private" ? savedReconnect : pagePrivateRoute) : null;
+    const privateRoute = isNitroSocket && !spectatorSocket ? (savedReconnect?.kind === "private" ? savedReconnect : pagePrivateRoute) : null;
     let spectatorFollowPending = false;
     if (spectatorSocket) {
       try {
         const savedCamera = win.localStorage.getItem("cameraFullScreen");
-        spectatorFollowPending = savedCamera === "1" ||
+        const fullPitch = savedCamera === "1" ||
           (savedCamera === null && win.localStorage.getItem("initialCameraFullScreen") === "1");
+        spectatorFollowPending = inGameSpectatorSocket ? !fullPitch : fullPitch;
       } catch (_) {}
     }
     if (privateRoute) {
+      if (privateRoute.team !== 0 && privateRoute.team !== 1) {
+        const message = "Cannot identify your party team. Use a unique player name, rejoin the party, then try again.";
+        win.alert(message);
+        throw new Error(message);
+      }
       const teamQuery = privateRoute.team === null ? "" : `&team=${privateRoute.team}`;
       finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
       console.log(`[nc-local-4v4] private party ${privateRoute.partyCode}${privateRoute.team === null ? "" : `, team ${privateRoute.team + 1}`}`);
     }
-    if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}spectate=1`;
+    if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}${inGameSpectatorSocket ? "ingameSpectate" : "spectate"}=1`;
     if (reconnectSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
     if (isNitroSocket) console.log(`[nc-local-4v4] ${text} → ${finalUrl}`);
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
     if (isNitroSocket && socketIntent) {
+      hostedMatchActive = true;
+      spectatorChatSocket = socket;
+      observerMovement=false;observerKeys=0;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
+      spectatorChatWatching = spectatorSocket;
+      spectatorChatSupported = false;
+      const chatHistory = document.getElementById("nc-spectator-chat-history");
+      if (chatHistory) chatHistory.textContent = "";
       let playerJoinSent = false;
       let matchEnded = false;
       let reconnectRefreshTimer = null;
+      let pendingObserverJoin = null;
+      let observerCapabilityTimer = null;
+      let observerSupported = false;
       reconnectRequested = false;
       spectateRequested = false;
+      inGameSpectateRequested = false;
       connectionAttemptActive = true;
       const nativeSend = socket.send;
       socket.send = function (data) {
         try {
           const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) :
             ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          if(spectatorSocket && bytes?.[0]===4) {
+            let text="";for(let i=0;i<(bytes[1]||0) && 3+i*2<bytes.length;i++)text+=String.fromCharCode(bytes[2+i*2]*256+bytes[3+i*2]);
+            sendSpectatorMessage(text);return;
+          }
           // Server ping sockets send opcode 99. Record reconnect eligibility
+          if (inGameSpectatorSocket && (bytes?.[0] === 1 || (bytes?.[0] === 7 && bytes[1] === 1)) && !observerSupported) {
+            if (pendingObserverJoin) return;
+            pendingObserverJoin = bytes.slice();
+            observerCapabilityTimer = setTimeout(() => {
+              pendingObserverJoin = null;
+              socket.close();
+              win.alert("In-game spectate needs the updated 4v4 server. Ordinary Spectate is still available.");
+            }, 5000);
+            return nativeSend.call(this, new Uint8Array([26, 2]));
+          }
           // only when the stock client sends a real player join (opcode 1).
           if (!spectatorSocket && bytes?.[0] === 1) {
+            // The stock party start can share a reservation among members.
+            // Give each hosted player its persistent, tab-specific identity.
+            const packet = bytes.slice();
+            new DataView(packet.buffer).setInt32(1, reservationKey);
+            data = packet;
+            pendingPartyRoute = null;
+            pendingPartyServer = null;
             playerJoinSent = true;
             saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode);
             clearInterval(reconnectRefreshTimer);
@@ -406,14 +828,34 @@
         return nativeSend.call(this, data);
       };
       socket.addEventListener("open", () => { connectionAttemptActive = false; });
-      socket.addEventListener("message", ({ data }) => {
+      socket.addEventListener("message", (event) => {
+        const { data } = event;
         try {
           const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) :
             ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          if (bytes?.[0] === 26) {
+            event.stopImmediatePropagation?.();
+            if (inGameSpectatorSocket && bytes[1] === 2 && pendingObserverJoin) {
+              observerSupported = true;
+              observerMovement=bytes[2]===1;
+              clearTimeout(observerCapabilityTimer);
+              const join = pendingObserverJoin;
+              pendingObserverJoin = null;
+              nativeSend.call(socket, join);
+              return;
+            }
+            if (spectatorChatSocket === socket) receiveSpectatorChat(bytes);
+            return;
+          }
           if (!spectatorSocket && bytes?.[0] === 14) {
             matchEnded = true;
             clearInterval(reconnectRefreshTimer);
             try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
+          }
+          if(bytes?.[0]===7) {
+            installObserverSensors();
+            const capture={index:0};controlBodyCapture=capture;
+            setTimeout(()=>{if(controlBodyCapture===capture)controlBodyCapture=null;},0);
           }
           if (spectatorSocket && spectatorFollowPending && bytes?.[0] === 5) {
             spectatorFollowPending = false;
@@ -424,6 +866,14 @@
         } catch (_) {}
       });
       socket.addEventListener("close", (event) => {
+        clearTimeout(observerCapabilityTimer);
+        pendingObserverJoin = null;
+        if (spectatorChatSocket === socket) {
+          observerMovement=false;observerKeys=0;chatPending=false;clearTimeout(chatConfirmTimer);
+          spectatorChatSocket = null;
+          spectatorChatSupported = false;
+          refreshSpectatorChat();
+        }
         clearInterval(reconnectRefreshTimer);
         connectionAttemptActive = false;
         const reason = String(event.reason || "");
@@ -487,6 +937,14 @@
           const node = queue.shift();
           const children = node?.children;
           if (!children?.length) continue;
+          // The stock control packet rebuilds ten player Text labels but leaves
+          // previous batches attached. Only name labels have animScaleX;
+          // remove stale batches, preserving the current labels and other HUD text.
+          const labels = children.filter(child => typeof child?.text === "string" && typeof child.animScaleX === "number");
+          for (const stale of labels.slice(0, Math.max(0, labels.length - 10))) {
+            node.removeChild(stale);
+            stale.destroy?.();
+          }
           for (let index = 0; index < children.length; index++) {
             const child = children[index];
             const position = child?.lastPhysicsPosition;
@@ -521,7 +979,7 @@
         const originalRender = prototype.render;
         if (typeof originalRender !== "function" || originalRender.__nc4v4SpareWrapped) continue;
         const render = function (stage, ...args) {
-          hideSpareSlots(stage);
+          if (hostedMatchActive) hideSpareSlots(stage);
           return originalRender.call(this, stage, ...args);
         };
         render.__nc4v4SpareWrapped = true;
@@ -539,6 +997,72 @@
   }
   const filterPoll = setInterval(() => { if (installSpareSlotFilter()) clearInterval(filterPoll); }, 50);
   installSpareSlotFilter();
+
+  function refreshModeControls() {
+    const stock = document.getElementById("gamemode-4");
+    if (!stock || !win.nitroclash) return;
+    if (!stockSelectMode) {
+      stockSelectMode = win.nitroclash.selectMode;
+      // Also cover the site's mode shortcuts, which call this API directly.
+      win.nitroclash.selectMode = mode => changeNetworkMode(true, mode);
+    }
+    let button = document.getElementById("nc-hosted-mode");
+    if (!button) {
+      button = document.createElement(stock.tagName || "div");
+      button.id = "nc-hosted-mode";
+      button.type = "button";
+      button.textContent = "4 vs 4";
+      button.title = "Hosted 4v4 — Europe / Europe 2";
+      button.addEventListener("click", () => changeNetworkMode(false, 4));
+      stock.insertAdjacentElement("beforebegin", button);
+      button.insertAdjacentText?.("afterend", " ");
+    }
+    const base = String(stock.className || "").replace(/\bselected\b/g, "").trim();
+    button.className = base + (hostedMode ? " selected" : "");
+    stock.className = base + (!hostedMode && selectedMode === 4 ? " selected" : "");
+    button.disabled = partySocket?.readyState === 1 && !partyIsHost;
+    const select = document.getElementById("server");
+    if (!select) return;
+    let changed = false;
+    for (const option of [...select.options]) {
+      if (!!serverChoices[option.value] !== hostedMode) {
+        option.remove();
+        changed = true;
+      } else if (serverChoices[option.value]) {
+        const ping = measuredServerPings.has(option.value) ? measuredServerPings.get(option.value) : undefined;
+        const shownPing = ping === undefined ? "measuring…" : ping === null ? "unavailable" : String(ping);
+        const cachedPing = win.jQuery?.(option)?.data?.("ping");
+        if (option.dataset.ping !== shownPing || (cachedPing !== undefined && String(cachedPing) !== shownPing)) {
+          option.dataset.ping = shownPing;
+          win.jQuery?.(option)?.data?.("ping", shownPing);
+          changed = true;
+        }
+        const label = serverChoices[option.value].label + " (" + (option.dataset.players || "0") + ")";
+        if (option.textContent !== label) { option.textContent = label; changed = true; }
+      }
+    }
+    // Mode changes rebuild the stock select. Preserve the host's region or the
+    // last local choice, never the stock client's fastest opposite-network ping.
+    const wanted = partyRegion || (hostedMode ? preferredHostedRegion : preferredOfficialRegion);
+    if ([...select.options].some(option => option.value === wanted) && select.value !== wanted) {
+      select.value = wanted;
+      changed = true;
+    }
+    if (!select.__ncModeListener) {
+      select.__ncModeListener = true;
+      const rememberRegion = () => {
+        if (serverChoices[select.value]) preferredHostedRegion = select.value;
+        else if (select.value) preferredOfficialRegion = select.value;
+      };
+      select.addEventListener("change", rememberRegion);
+      win.jQuery?.(select)?.on?.("selectmenuchange", rememberRegion);
+    }
+    if (changed) try { win.jQuery?.(select)?.selectmenu?.("refresh"); } catch (_) {}
+    // Keep the share URL free from an obsolete official/hosted page preference;
+    // the host's live lobby state is what selects the mode now.
+    const link = document.getElementById("team-share-link");
+    if (link && win.location.hash) link.value = win.location.origin + "/" + win.location.hash;
+  }
 
   function installInterface() {
     if (!document.body) return false;
@@ -563,7 +1087,8 @@
           if (suffix === "lost") panel.style.display = "none";
           win.nitroclash.backToHomepage();
           setTimeout(() => {
-            win.nitroclash.selectMode(4);
+            preferredHostedRegion = readReconnectSession()?.serverCode || defaultServerCode;
+            changeNetworkMode(false, 4);
             win.nitroclash.clickPlay();
           }, 100);
         } catch (error) {
@@ -578,48 +1103,52 @@
         panel.appendChild(button);
     };
     const relabel = () => {
-      const serverSelect = document.getElementById("server");
-      if (serverSelect) {
-        let serverLabelsChanged = false;
-        const hostedOptionsReady = Object.keys(serverChoices).every((code) =>
-          [...serverSelect.options].some((candidate) => candidate.value === code));
-        if (hostedOptionsReady && !win.__nc4v4ServerDefaultApplied) {
-          win.__nc4v4ServerDefaultApplied = true;
-          serverSelect.value = defaultServerCode;
-          serverSelect.dispatchEvent(new win.Event("change", { bubbles: true }));
-          serverLabelsChanged = true;
-        }
-        for (const [code, choice] of Object.entries(serverChoices)) {
-          const option = [...serverSelect.options].find((candidate) => candidate.value === code);
-          if (!option) continue;
-          const players = option.dataset.players || "0";
-          const label = `${choice.label} (${players})`;
-          if (option.textContent !== label) {
-            option.textContent = label;
-            serverLabelsChanged = true;
-          }
-        }
-        if (serverLabelsChanged) {
-          try { win.jQuery?.(serverSelect)?.selectmenu?.("refresh"); } catch (_) {}
-        }
-        const selectedChoice = serverChoices[serverSelect.value];
-        const selectedOption = [...serverSelect.options].find((candidate) => candidate.value === serverSelect.value);
-        const serverButtonText = document.querySelector("#server-button .ui-selectmenu-text");
-        if (selectedChoice && selectedOption && serverButtonText)
-          serverButtonText.textContent = selectedOption.textContent;
+      refreshMeasuredPings();
+      installSpectatorChat();
+      refreshSpectatorChat();
+      if (win.nitroclash && !win.__nc4v4InitialModeApplied &&
+          document.getElementById("homepage-loaded")?.style.display === "block") {
+        win.__nc4v4InitialModeApplied = true;
+        if (!partySocket) changeNetworkMode(!hostedMode, selectedMode);
       }
-      const button = document.getElementById("gamemode-4") ||
-        [...document.querySelectorAll("button")].find((candidate) => /5\s*(?:vs\.?|v)\s*5/i.test(candidate.textContent));
-      if (button) {
-        button.dataset.nc4v4 = "1";
-        for (const node of button.childNodes) {
-          if (node.nodeType === Node.TEXT_NODE) node.textContent = node.textContent.replace(/5\s*(?:vs\.?|v)\s*5/i, "4 VS 4");
+      refreshModeControls();
+      if (win.nitroclash && !win.nitroclash.clickPlay?.__nc4v4Wrapped) {
+        const originalPlay = win.nitroclash.clickPlay;
+        if (typeof originalPlay === "function") {
+          const wrappedPlay = function (...args) {
+            refreshModeControls();
+            spectateRequested = false;
+            inGameSpectateRequested = false;
+            return originalPlay.apply(this, args);
+          };
+          wrappedPlay.__nc4v4Wrapped = true;
+          win.nitroclash.clickPlay = wrappedPlay;
         }
-        if (/5\s*(?:vs\.?|v)\s*5/i.test(button.textContent))
-          button.textContent = button.textContent.replace(/5\s*(?:vs\.?|v)\s*5/i, "4 VS 4");
-        button.title = "Hosted 4v4 (internally uses the 5v5 client layout)";
       }
       const session = readReconnectSession();
+      const nativeSpectateButton = document.getElementById("spectate-button");
+      if (nativeSpectateButton && !document.getElementById("nc-ingame-spectate")) {
+        const button = document.createElement(nativeSpectateButton.tagName || "button");
+        button.id = "nc-ingame-spectate";
+        button.type = "button";
+        button.textContent = "In-game spectate";
+        button.title = "Watch from outside the pitch. Two spaces per active public 4v4 match.";
+        button.className=nativeSpectateButton.className;
+        button.style.cssText=nativeSpectateButton.style.cssText;
+        button.style.marginLeft="10px";
+        button.addEventListener("click", () => {
+          if (!hostedMode || partySocket?.readyState === 1) return;
+          reconnectRequested = false;
+          launchingInGameSpectate = true;
+          try { win.nitroclash.clickSpectate(); } finally { launchingInGameSpectate = false; }
+        });
+        nativeSpectateButton.insertAdjacentElement("afterend", button);
+      }
+      const inGameButton = document.getElementById("nc-ingame-spectate");
+      if (inGameButton) {
+        inGameButton.style.display = hostedMode ? "inline-block" : "none";
+        inGameButton.disabled = partySocket?.readyState === 1 || !!document.getElementById("play-button")?.disabled;
+      }
       installReconnectButton(document.getElementById("connection-lost"), "lost");
       installReconnectButton(document.getElementById("homepage-loaded"), "home");
       for (const reconnectButton of document.querySelectorAll('[id^="nc-local-4v4-reconnect-"]')) {
@@ -635,7 +1164,9 @@
         const originalSpectate = win.nitroclash.clickSpectate;
         if (typeof originalSpectate === "function") {
           const wrappedSpectate = function (...args) {
-            spectateRequested = true;
+            refreshModeControls();
+            inGameSpectateRequested = launchingInGameSpectate;
+            spectateRequested = hostedMode;
             reconnectRequested = false;
             return originalSpectate.apply(this, args);
           };
@@ -656,7 +1187,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.7.2";
+    badge.textContent = "HOSTED 4v4 v3.12.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

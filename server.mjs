@@ -201,6 +201,8 @@ function makeWorld() {
   let worldReference = null;
   const world = {
     turn: 0,
+    goalTurn: null,
+    replayTurnOffset: 0,
     state: 2,
     physics,
     players,
@@ -254,7 +256,9 @@ function controlPacket(world, controlledSlot, username) {
   buffer[1] = 1;
   buffer[2] = controlledSlot;
   buffer.writeInt32BE(world.turn, 3);
-  buffer.writeInt32BE(0, 7);
+  // Negative control delay means no player takeover, and prevents the stock
+  // client replacing the camera target's name with the spectator's own name.
+  buffer.writeInt32BE(username === null ? -1 : 0, 7);
   buffer.writeInt16BE(world.scores[0], 11);
   buffer.writeInt16BE(world.scores[1], 13);
   let offset = 15;
@@ -364,7 +368,7 @@ function chatPacket(slot, message) {
   return buffer;
 }
 
-function liveStatsPacket(world, connectedSlots = new Set([0])) {
+function liveStatsPacket(world, connectedSlots = new Set([0]), pings = new Map()) {
   const buffer = Buffer.alloc(1 + CLIENT_SLOTS * 8);
   buffer[0] = 18;
   let offset = 1;
@@ -375,9 +379,8 @@ function liveStatsPacket(world, connectedSlots = new Set([0])) {
     buffer[offset++] = Math.min(255, stats.saves);
     buffer.writeInt16BE(Math.max(-32768, Math.min(32767, stats.points)), offset);
     offset += 2;
-    // Connected browser players get a small nonzero value; empty/server-side
-    // slots remain zero, matching how the stock scoreboard distinguishes AI.
-    buffer.writeInt16BE(connectedSlots.has(slot) ? 1 : 0, offset);
+    // Zero means not measured yet (or an empty slot), never fabricated latency.
+    buffer.writeInt16BE(connectedSlots.has(slot) ? Math.max(0, Math.min(32767, Math.round(pings.get(slot) || 0))) : 0, offset);
     offset += 2;
     buffer[offset++] = 0; // No account/rank database is used by the local server.
   }
@@ -385,7 +388,7 @@ function liveStatsPacket(world, connectedSlots = new Set([0])) {
 }
 
 function recordReplayEvent(world, type, slot1 = 255, slot2 = 255, speed = 0, name = "") {
-  world.replayEvents.push({ turn: world.turn, type, slot1, slot2, speed, name });
+  world.replayEvents.push({ turn: world.turn + world.replayTurnOffset, type, slot1, slot2, speed, name });
 }
 
 function awardPoints(world, slot, type, points = ACTION_POINTS[type] || 0, useCooldown = false) {
@@ -432,6 +435,7 @@ function gameOverPacket(world) {
 }
 
 function recordGoal(world, goal) {
+  world.goalTurn = world.turn;
   world.scores[goal.team]++;
   const packets = [];
   const goalAward = awardPoints(world, goal.scorer, ACTION.GOAL);
@@ -807,14 +811,37 @@ function spectatorArenas() {
 }
 
 function arenaStatsPacket(arena) {
-  return liveStatsPacket(arena.world, new Set(arena.connections.keys()));
+  const connections = new Map(arena.connections);
+  for (const watcher of arena.spectators) if (watcher.inGameSpectator) connections.set(watcher.slot, watcher);
+  const pings = new Map([...connections].map(([slot, connection]) =>
+    [slot, performance.now() - (connection.pingMeasuredAt ?? -Infinity) < 10000 ? connection.pingMs : 0]));
+  return liveStatsPacket(arena.world, new Set(connections.keys()), pings);
+}
+
+function probeConnectionPing(connection) {
+  const now = performance.now();
+  if (connection.pendingPing && now - connection.pingSentAt < 5000) return;
+  connection.pendingPing = crypto.randomBytes(8);
+  connection.pingSentAt = now;
+  connection.send(connection.pendingPing, 9); // Browsers reply with protocol pong.
+}
+
+function receiveConnectionPong(connection, payload) {
+  if (!connection.pendingPing || !payload.equals(connection.pendingPing)) return;
+  const now = performance.now();
+  const sample = Math.max(1, now - connection.pingSentAt);
+  connection.pingMs = connection.pingMs == null ? sample : connection.pingMs * 0.5 + sample * 0.5;
+  connection.pingMeasuredAt = now;
+  connection.pendingPing = null;
 }
 
 function saveArenaReplayFrame(arena, snapshot) {
   if (!snapshot || snapshot[0] !== 5) return;
-  const turn = snapshot.readInt32BE(2);
+  const turn = snapshot.readInt32BE(2) + arena.world.replayTurnOffset;
   if (turn <= arena.lastReplayTurn) return;
-  arena.fullReplayFrames.push(ncrFrameFromStatePacket(snapshot, arena.world.boosts));
+  const frame = ncrFrameFromStatePacket(snapshot, arena.world.boosts);
+  frame.writeInt32BE(turn, 0);
+  arena.fullReplayFrames.push(frame);
   arena.lastReplayTurn = turn;
   arena.cachedReplay = null;
 }
@@ -848,7 +875,17 @@ function applyArenaInputs(arena) {
   }
 }
 
+// Animation packets advance turns; the next kickoff resumes at the goal time.
+// Downloaded replay frames/events keep a separate continuous timeline.
+function resumeGoalClock(world) {
+  if (world.goalTurn === null) return;
+  world.replayTurnOffset += world.turn - world.goalTurn;
+  world.turn = world.goalTurn;
+  world.goalTurn = null;
+}
+
 function completeGoalReplay(arena) {
+  resumeGoalClock(arena.world);
   arena.replaySkipVotes.clear();
   if (arena.world.turn >= REGULATION_TICKS && arena.world.scores[0] !== arena.world.scores[1]) {
     arena.world.regulationFinished = true;
@@ -925,6 +962,7 @@ function runArenaTick(arena) {
   const now = performance.now();
   let steps = 0;
   while (now >= arena.nextTickAt && steps < 5) {
+    moveInGameSpectators(arena);
     let snapshot = null;
     if (Date.now() >= arena.startsAt) {
       if (arena.phase === "playing") {
@@ -1012,8 +1050,11 @@ function runArenaTick(arena) {
       }
     }
     arena.networkTick++;
-    if (arena.phase !== "ended" && arena.networkTick % PHYSICS_HZ === 0)
+    if (arena.phase !== "ended" && arena.networkTick % PHYSICS_HZ === 0) {
+      for (const connection of [...arena.connections.values(), ...arena.spectators])
+        if (connection.ready && !connection.cleaned) probeConnectionPing(connection);
       arenaSend(arena, arenaStatsPacket(arena));
+    }
     if (arena.phase !== "ended" && arena.networkTick % SNAPSHOT_EVERY_TICKS === 0)
       arenaSend(arena, snapshot || statePacket(arena.world));
     arena.nextTickAt += TICK_MS;
@@ -1166,6 +1207,7 @@ function assignPrivateConnection(connection) {
 }
 
 function sendArenaEntry(connection, arena) {
+  connection.send(Buffer.from([26, 0])); // Addon spectator-chat capability.
   connection.send(controlPacket(arena.world, connection.slot, connection.username));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
@@ -1180,7 +1222,8 @@ function sendArenaEntry(connection, arena) {
 }
 
 function sendSpectatorEntry(connection, arena) {
-  const focusSlot = [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
+  connection.send(Buffer.from([26, 0]));
+  const focusSlot = connection.inGameSpectator ? connection.slot : [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
   connection.send(controlPacket(arena.world, focusSlot, null));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
@@ -1191,11 +1234,13 @@ function sendSpectatorEntry(connection, arena) {
 }
 
 function changeSpectatedArena(connection, direction) {
+  if (connection.inGameSpectator) return;
   const available = spectatorArenas();
   if (!available.length) return connection.close("No active 4v4 games");
   const currentIndex = available.indexOf(connection.arena);
   const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + available.length) % available.length;
   const nextArena = available[nextIndex];
+  if (connection.arena === nextArena) return;
   if (connection.arena !== nextArena) {
     connection.arena?.spectators.delete(connection);
     connection.arena = nextArena;
@@ -1292,6 +1337,7 @@ function completeArenaRematch(arena) {
   }
 
   arena.world = makeWorld();
+  for (const watcher of arena.spectators) if (watcher.inGameSpectator) placeInGameSpectator(watcher);
   arena.kickoffSpawns = randomKickoffSpawns();
   for (const slot of PLAYABLE_SLOTS) parkSlot(arena, slot);
   for (const [slot, connection] of staying) {
@@ -1333,6 +1379,72 @@ function createUnusedReservationKey() {
   return key;
 }
 
+function handleSpectatorChat(connection, packet) {
+  if (!connection.ready || !connection.arena) return;
+  if (packet[1] === 0) {
+    connection.spectatorChatEnabled = packet[2] === 1;
+    return;
+  }
+  if (packet[1] !== 1 || !connection.spectator || !connection.spectatorChatEnabled) return;
+  if (packet.length < 3 || packet.length !== 3 + 2 * packet[2]) return;
+  const now = Date.now();
+  if (now - connection.lastChatAt < 1000) { connection.send(Buffer.from([26, 3])); return; }
+  const message = readString(packet, 2).value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 255);
+  if (!message) return;
+  const name = connection.username.slice(0, 12);
+  const outgoing = Buffer.alloc(4 + 2 * name.length + 2 * message.length);
+  outgoing[0] = 26;
+  outgoing[1] = 1;
+  const offset = putString(outgoing, 2, name);
+  putString(outgoing, offset, message);
+  connection.lastChatAt = now;
+  connection.send(Buffer.from([26, 4])); // Confirm acceptance to the sender.
+  for (const recipient of [...connection.arena.connections.values(), ...connection.arena.spectators]) {
+    if (recipient.ready && !recipient.cleaned && recipient.spectatorChatEnabled) recipient.send(outgoing);
+  }
+}
+
+function placeInGameSpectator(connection) {
+  const player = connection.arena.world.players[connection.slot];
+  // These two stock-layout positions have no physics bodies. Ghost movement
+  // cannot collide, receive boosts or compete for the ball.
+  Object.assign(player, { x: connection.slot === 8 ? 46 : 54, y: -6, name: connection.username, flags: 0 });
+  connection.observerKeys = 0;
+}
+
+function moveInGameSpectators(arena) {
+  for (const watcher of arena.spectators) {
+    if (!watcher.inGameSpectator || !watcher.ready || watcher.cleaned) continue;
+    const keys = performance.now() - (watcher.observerInputAt ?? -Infinity) < 600 ? watcher.observerKeys : 0;
+    const dx = Number(!!(keys & 8)) - Number(!!(keys & 4));
+    const dy = Number(!!(keys & 2)) - Number(!!(keys & 1));
+    if (!dx && !dy) continue;
+    const player = arena.world.players[watcher.slot];
+    const distance = (keys & 16 ? 24 : 12) / PHYSICS_HZ / Math.hypot(dx, dy);
+    player.x = Math.max(-15, Math.min(115, player.x + dx * distance));
+    player.y = Math.max(-15, Math.min(75, player.y + dy * distance));
+    player.angle = Math.atan2(dy, dx);
+  }
+}
+
+function joinInGameSpectator(connection) {
+  if (connection.kind === "private") return connection.close("In-game spectate is public matches only");
+  for (const arena of spectatorArenas()) {
+    const occupied = new Set([...arena.spectators].filter(c => c.inGameSpectator).map(c => c.slot));
+    const slot = [8, 9].find(slot => !occupied.has(slot));
+    if (slot === undefined) continue;
+    connection.arena = arena;
+    connection.slot = slot;
+    connection.joined = true;
+    arena.spectators.add(connection);
+    placeInGameSpectator(connection);
+    arenaSend(arena, namePacket(slot, connection.username));
+    connection.send(mapPacket());
+    return;
+  }
+  connection.close("No in-game spectator spaces in active public matches");
+}
+
 function installSharedUpgradeHandler(serverInstance) {
   serverInstance.on("upgrade", (request, socket) => {
     const upgradeUrl = new URL(request.url || "/", `http://${request.headers.host || `${HOST}:${PORT}`}`);
@@ -1341,7 +1453,8 @@ function installSharedUpgradeHandler(serverInstance) {
     const requestedTeamText = upgradeUrl.searchParams.get("team");
     const requestedTeam = requestedTeamText === "0" || requestedTeamText === "1" ? Number(requestedTeamText) : null;
     const reconnectRequested = upgradeUrl.searchParams.get("reconnect") === "1";
-    const spectatorRequested = upgradeUrl.searchParams.get("spectate") === "1";
+    const inGameSpectator = upgradeUrl.searchParams.get("ingameSpectate") === "1";
+    const spectatorRequested = upgradeUrl.searchParams.get("spectate") === "1" || inGameSpectator;
     const key = request.headers["sec-websocket-key"];
     if (!key) return socket.destroy();
     const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
@@ -1365,6 +1478,7 @@ function installSharedUpgradeHandler(serverInstance) {
       lastChatAt: 0,
       resuming: false,
       spectator: spectatorRequested,
+      inGameSpectator,
       reconnectRequested,
       kind: privateParty ? "private" : "public",
       partyCode: privateParty ? requestedParty : null,
@@ -1385,13 +1499,33 @@ function installSharedUpgradeHandler(serverInstance) {
     socket.on("data", (chunk) => {
       for (const frame of readFrames(connection, chunk)) {
         if (frame.opcode === 8) return socket.end(wsFrame(Buffer.alloc(0), 8));
+        if (frame.opcode === 9) { connection.send(frame.payload, 10); continue; }
+        if (frame.opcode === 10) { receiveConnectionPong(connection, frame.payload); continue; }
         if (frame.opcode !== 2 || frame.payload.length === 0) continue;
         const packet = frame.payload;
         switch (packet[0]) {
+          case 26:
+            if (packet[1] === 2 && connection.inGameSpectator) {
+              connection.send(Buffer.from([26, 2, 1])); // Ghost movement supported.
+              break;
+            }
+            handleSpectatorChat(connection, packet);
+            break;
+          case 27:
+            if (connection.inGameSpectator && connection.ready && packet.length === 2 && packet[1] <= 31) {
+              connection.observerKeys = packet[1];
+              connection.observerInputAt = performance.now();
+            }
+            break;
           case 99:
             connection.send(Buffer.from([99]));
             break;
           case 1: {
+            if (connection.inGameSpectator && !connection.joined) {
+              connection.username = readString(packet, 5).value.trim().slice(0, 12) || "Spectator";
+              joinInGameSpectator(connection);
+              break;
+            }
             if (connection.spectator) break;
             if (connection.joined) break;
             connection.reservationKey = packet.length >= 5 ? packet.readInt32BE(1) : 0;
@@ -1421,9 +1555,21 @@ function installSharedUpgradeHandler(serverInstance) {
             break;
           }
           case 7: {
+            if (connection.inGameSpectator) {
+              if (packet[1] === 1 && !connection.joined) {
+                connection.username = readString(packet, 3).value.trim().slice(0, 12) || "Spectator";
+                joinInGameSpectator(connection);
+                if (connection.joined) {
+                  connection.ready = true;
+                  sendSpectatorEntry(connection, connection.arena);
+                }
+              }
+              break;
+            }
             if (!connection.spectator || packet.length < 2) break;
             if (packet[1] === 1) {
               if (connection.joined) break;
+              connection.username = readString(packet, 3).value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 12) || "Spectator";
               if (connection.kind === "private") {
                 connection.close("Private spectating is disabled");
                 break;
@@ -1465,6 +1611,11 @@ function installSharedUpgradeHandler(serverInstance) {
             connection.send(Buffer.from([4]));
             break;
           case 3: {
+            if (connection.inGameSpectator && connection.joined && !connection.ready) {
+              connection.ready = true;
+              sendSpectatorEntry(connection, connection.arena);
+              break;
+            }
             if (connection.spectator) break;
             if (!connection.joined || connection.ready) break;
             connection.ready = true;
@@ -1515,6 +1666,10 @@ function installSharedUpgradeHandler(serverInstance) {
       const arena = connection.arena;
       if (connection.spectator) {
         arena?.spectators.delete(connection);
+        if (arena && connection.inGameSpectator) {
+          Object.assign(arena.world.players[connection.slot], { x: -100, y: -100, name: "" });
+          arenaSend(arena, namePacket(connection.slot, ""));
+        }
         if (arena) console.log(`Spectator left public arena ${arena.id}`);
         return;
       }
@@ -1602,9 +1757,11 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
   const send = (payload, opcode = 2) => socket.writable && socket.write(wsFrame(payload, opcode));
   const saveReplayFrame = (snapshot) => {
     if (!snapshot || snapshot[0] !== 5) return;
-    const turn = snapshot.readInt32BE(2);
+    const turn = snapshot.readInt32BE(2) + connection.world.replayTurnOffset;
     if (turn <= connection.lastReplayTurn) return;
-    connection.fullReplayFrames.push(ncrFrameFromStatePacket(snapshot, connection.world.boosts));
+    const frame = ncrFrameFromStatePacket(snapshot, connection.world.boosts);
+    frame.writeInt32BE(turn, 0);
+    connection.fullReplayFrames.push(frame);
     connection.lastReplayTurn = turn;
     connection.cachedReplay = null;
   };
@@ -1774,6 +1931,7 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
                   snapshot = replayStatePacket(connection.replayFrames[connection.replayFrames.length - 1], connection.world.turn);
                   saveReplayFrame(snapshot);
                   if (connection.phaseTicks >= REPLAY_HOLD_TICKS) {
+                    resumeGoalClock(connection.world);
                     if (connection.world.turn >= REGULATION_TICKS &&
                         connection.world.scores[0] !== connection.world.scores[1]) {
                       connection.world.regulationFinished = true;
@@ -1892,6 +2050,15 @@ export {
   recordGoal,
   registerRematchVote,
   registerReplaySkipVote,
+  runArenaTick,
+  handleSpectatorChat,
+  sendSpectatorEntry,
+  changeSpectatedArena,
+  joinInGameSpectator,
+  arenaStatsPacket,
+  probeConnectionPing,
+  receiveConnectionPong,
+  moveInGameSpectators,
   server,
   statePacket,
 };
