@@ -1,6 +1,14 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.15.2**
+Current release version: **3.17.0**
+
+Version 3.17.0 measures Tab ping with browser-echoed application packets, avoiding proxy heartbeat latency. Update both server.mjs (restart) and the userscript. Homepage counts refresh every ten seconds and the visible selected label is reconciled with fresh population data. A count includes connected players across matches on that server, excluding spectators. Localhost can legitimately measure 1 ms.
+
+Version 3.16.0 allows duplicate party display names without the previous unique-name join error. Team routing uses the initial official roster and retains the local team when repeated names make later matching ambiguous; unresolved routes use server balancing. Guests cannot send mode/server overrides and follow authoritative host settings. The official party protocol has no supported kick action/member identifiers: a kick button is not included and requires a separate party service.
+
+Hosted servers now remove idle players (30-second server fallback) and dead connections (15 seconds without a matching pong), clearing the live slot immediately. Private disconnects no longer reserve a place: reconnect succeeds only while that place remains free. Native kick/connection-loss screens close their hosted socket automatically. Typing counts as activity.
+
+Ordinary and in-game spectators get a top-right Join this match button when their current public hosted 4v4 arena has room. It reloads directly into that same arena as a player, with server-side full/private/ended checks; spectators cannot use it for private games or original modes. Full/old servers show no offer. Sending spectator chat clears/blurs the input immediately; press T to write again, while failed text is restored without stealing focus. Update server.mjs and restart both backends, then update the userscript. No deployment performed.
 
 Version 3.15.2 adds a homepage Show in-game spectators checkbox, enabled by default and saved in this browser. Turning it off hides the two spectator characters and their on-pitch name labels on your screen only. Other viewers, players, spectator movement and the separate spectator chat setting are unaffected. Turning it back on restores the characters and labels. Userscript-only update; server unchanged.
 

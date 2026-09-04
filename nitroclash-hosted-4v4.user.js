@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.15.2
+// @version      3.17.0
 // @description  Connects NitroClash game sockets to the hosted 4v4 server
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -30,6 +30,17 @@
   let hostedMatchActive = false;
   let preferredHostedRegion = "NC4EU";
   let preferredOfficialRegion = "EU1";
+  let quickJoin=null,quickJoinStarted=false,joinOffer=null;
+  try{const saved=JSON.parse(win.sessionStorage.getItem("nc4v4-quick-join")||"null");if(saved?.expires>Date.now() && Number.isInteger(saved.arenaId) && saved.arenaId>0 && ["NC4EU","NC4OLD"].includes(saved.serverCode)){quickJoin=saved;hostedMode=true;selectedMode=4;preferredHostedRegion=saved.serverCode;}}catch(_){}
+  let lastActivitySent=0,refreshingNativeActivity=false;
+  function markGameActivity(){if(spectatorChatSocket?.readyState===1 && Date.now()-lastActivitySent>1000){lastActivitySent=Date.now();spectatorChatSocket.send(new Uint8Array([29]));
+    if(document.activeElement?.id==="chat-input" && win.KeyboardEvent){refreshingNativeActivity=true;try{win.dispatchEvent(new win.KeyboardEvent("keydown",{key:"",keyCode:0,which:0}));}finally{refreshingNativeActivity=false;}}}}
+  function refreshJoinButton(){
+    let button=document.getElementById("nc-join-spectated-match");
+    if(!button && document.body){button=document.createElement("button");button.id="nc-join-spectated-match";button.textContent="Join this match";button.style.cssText="position:fixed;top:42px;right:8px;z-index:10000;padding:8px 12px;border:0;border-radius:6px;background:#5488c4;color:white;cursor:pointer";
+      button.addEventListener("click",()=>{if(!joinOffer?.spaces)return;win.sessionStorage.setItem("nc4v4-quick-join",JSON.stringify({...joinOffer,expires:Date.now()+30000}));button.disabled=true;win.nitroclash.backToHomepage();});document.body.appendChild(button);}
+    if(button)button.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 && joinOffer?.spaces>0 ? "block":"none";
+  }
   let stockSelectMode = null;
   function changeNetworkMode(official, mode = 4) {
     if (partySocket?.readyState === 1 && !partyIsHost) return;
@@ -105,7 +116,7 @@
   function refreshMeasuredPings() {
     const home = document.getElementById("homepage");
     if (!home || home.style.display === "none" || (win.getComputedStyle && win.getComputedStyle(home).display === "none") || Date.now() < nextPingRefresh) return;
-    nextPingRefresh = Date.now() + 15000;
+    nextPingRefresh = Date.now() + 10000;
     for (const [code, choice] of Object.entries(serverChoices)) {
       const samples = [];
       let socket, sentAt = 0, finished = false;
@@ -165,15 +176,17 @@
     sentChatText = message;
     chatPending=true;
     spectatorChatSocket.send(packet);
+    const input=document.getElementById("chat-input");if(input){input.value="";input.blur();}
     setChatStatus("Sending…");
     clearTimeout(chatConfirmTimer);
-    chatConfirmTimer=setTimeout(()=>{chatPending=false;setChatStatus("No confirmation received. Your text is kept; press Enter to retry.");},4000);
+    chatConfirmTimer=setTimeout(()=>{chatPending=false;restoreUnsentChat();setChatStatus("No delivery confirmation. Press T to try again.");},4000);
   }
+  function restoreUnsentChat(){const input=document.getElementById("chat-input");if(input && !input.value)input.value=sentChatText;}
   function confirmSpectatorMessage() {
     if (!chatPending) return;
     chatPending=false; clearTimeout(chatConfirmTimer);
     const input=document.getElementById("chat-input");
-    if(input && input.value.trim().slice(0,255)===sentChatText){input.value="";input.blur();}
+    // Never clear a new draft when an earlier message is acknowledged.
     setChatStatus("Sent");
   }
   function sendObserverKeys() {
@@ -189,6 +202,7 @@
     spectatorChatSocket.send(new Uint8Array([27,observerKeys]));
   }
   win.addEventListener("mousemove",event=>{
+    markGameActivity();
     if(!observerMovement || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || ""))return;
     observerPointer={x:event.clientX,y:event.clientY};
   },true);
@@ -211,6 +225,8 @@
   },{capture:true,passive:false});
   // Capture before the game's keyboard handlers, preserving normal text input.
   for(const type of ["keydown","keyup","keypress"]) win.addEventListener(type,event=>{
+    if(refreshingNativeActivity)return;
+    if(type==="keydown")markGameActivity();
     if(consumedChatKey===event.key) {
       event.preventDefault();event.stopImmediatePropagation();
       if(type==="keyup")consumedChatKey=null;
@@ -357,7 +373,7 @@
 
   function receiveSpectatorChat(bytes) {
     if(bytes[1]===4){confirmSpectatorMessage();return;}
-    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("Please wait one second, then press Enter again.");return;}
+    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);restoreUnsentChat();setChatStatus("Please wait one second, then press T to retry.");return;}
     if (bytes[1] === 0) {
       spectatorChatSupported = true;
       setChatStatus((observerMovement ? "Move: mouse or WASD/arrows · T: chat" : "Press T to chat with players · Enter to send"));
@@ -660,9 +676,9 @@
   };
   function trackPartySocket(socket) {
     partySocket = socket;
-    partyIsHost = true;
+    partyIsHost = false;
     partyRegion = null;
-    let name = "Player", code = "", rosterRoute = null, generation = 0, started = false;
+    let name = "Player", code = "", rosterRoute = null, generation = 0, started = false, ownTeam = null;
     socket.addEventListener("close", () => {
       if (partySocket === socket) { partySocket = null; partyRegion = null; partyIsHost = true; }
     });
@@ -682,6 +698,7 @@
         if (bytes?.[0] === 2) name = textAt(bytes, 1) || "Player";
         if (bytes?.[0] === 1) code = textAt(bytes, 1).toUpperCase();
         if (bytes?.[0] === 4) {
+          if(!partyIsHost)return;
           // Stock latency updates may propose their fastest original region.
           // Keep the explicitly selected network, including during party creation.
           const requested = textAt(bytes, 2);
@@ -705,17 +722,20 @@
         const bytes = bytesOf(data);
         if (bytes?.[0] === 1) {
           let offset = 2;
-          const matches = [];
+          const matches = [];let lastRosterName="",lastRosterTeam=null;
           let everyoneReady = bytes[1] > 0;
           for (let i = 0; i < bytes[1]; i++) {
             everyoneReady = everyoneReady && bytes[offset + 2] === 1;
             const player = textAt(bytes, offset + 3) || "Player";
             if (player === name) matches.push(bytes[offset + 1]);
+            lastRosterName=player;lastRosterTeam=bytes[offset+1];
             offset += 4 + bytes[offset + 3] * 2;
           }
+          if(matches.length && new Set(matches).size===1)ownTeam=matches[0];
+          else if(ownTeam===null && lastRosterName===name)ownTeam=lastRosterTeam;
           rosterRoute = /^[A-HJ-NP-Z0-9]{6}$/.test(code) ? {
             partyCode: code,
-            team: matches.length === 1 && (matches[0] === 0 || matches[0] === 1) ? matches[0] : null,
+            team: ownTeam===0 || ownTeam===1 ? ownTeam : null,
           } : null;
           const revision = ++generation;
           if (offset + 3 < bytes.length) {
@@ -821,21 +841,21 @@
       } catch (_) {}
     }
     if (privateRoute) {
-      if (privateRoute.team !== 0 && privateRoute.team !== 1) {
-        const message = "Cannot identify your party team. Use a unique player name, rejoin the party, then try again.";
-        win.alert(message);
-        throw new Error(message);
-      }
       const teamQuery = privateRoute.team === null ? "" : `&team=${privateRoute.team}`;
       finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
       console.log(`[nc-local-4v4] private party ${privateRoute.partyCode}${privateRoute.team === null ? "" : `, team ${privateRoute.team + 1}`}`);
     }
     if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}${inGameSpectatorSocket ? "ingameSpectate" : "spectate"}=1`;
     if (reconnectSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
+    if(isNitroSocket && socketIntent && !spectatorSocket && quickJoin) {
+      finalUrl+=(finalUrl.includes("?") ? "&":"/?")+"joinArena="+quickJoin.arenaId;
+      quickJoin=null;win.sessionStorage.removeItem("nc4v4-quick-join");
+    }
     if (isNitroSocket) console.log(`[nc-local-4v4] ${text} → ${finalUrl}`);
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
     if (isNitroSocket && socketIntent) {
       hostedMatchActive = true;
+      joinOffer=null;
       spectatorChatSocket = socket;
       observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
       spectatorChatWatching = spectatorSocket;
@@ -889,12 +909,23 @@
         } catch (_) {}
         return nativeSend.call(this, data);
       };
-      socket.addEventListener("open", () => { connectionAttemptActive = false; });
+      socket.addEventListener("open", () => { connectionAttemptActive = false; nativeSend.call(socket,new Uint8Array([30])); });
       socket.addEventListener("message", (event) => {
         const { data } = event;
         try {
           const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) :
             ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+          if(bytes?.[0]===30) {
+            event.stopImmediatePropagation?.();
+            if(bytes.length===9)nativeSend.call(socket,bytes);
+            return;
+          }
+          if(bytes?.[0]===28) {
+            event.stopImmediatePropagation?.();
+            if(bytes.length===6 && spectatorSocket){joinOffer={spaces:bytes[1],arenaId:new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint32(2),serverCode:gameServerCode};refreshJoinButton();}
+            return;
+          }
+          if(bytes?.[0]===12){setTimeout(()=>socket.close(),0);}
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
             if (inGameSpectatorSocket && bytes[1] === 2 && pendingObserverJoin) {
@@ -911,7 +942,7 @@
               nativeSend.call(socket, join);
               return;
             }
-            if (spectatorChatSocket === socket) receiveSpectatorChat(bytes);
+            if (spectatorChatSocket === socket) {receiveSpectatorChat(bytes);if(bytes[1]===0 && spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));}
             return;
           }
           if (!spectatorSocket && bytes?.[0] === 14) {
@@ -947,7 +978,7 @@
         pendingObserverJoin = null;
         if (spectatorChatSocket === socket) {
           observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);
-          spectatorChatSocket = null;
+          spectatorChatSocket = null;joinOffer=null;refreshJoinButton();
           spectatorChatSupported = false;
           refreshSpectatorChat();
         }
@@ -1123,6 +1154,7 @@
     button.className = base + (hostedMode ? " selected" : "");
     stock.className = base + (!hostedMode && selectedMode === 4 ? " selected" : "");
     button.disabled = partySocket?.readyState === 1 && !partyIsHost;
+    for(const modeButton of document.querySelectorAll('[id^="gamemode-"]'))modeButton.disabled=button.disabled;
     const select = document.getElementById("server");
     if (!select) return;
     let changed = false;
@@ -1164,7 +1196,12 @@
       select.addEventListener("change", rememberRegion);
       win.jQuery?.(select)?.on?.("selectmenuchange", rememberRegion);
     }
+    const visibleLabel=document.querySelector("#server-button .ui-selectmenu-text");
+    const selectedLabel=select.options[select.selectedIndex]?.textContent;
+    if(hostedMode && visibleLabel && visibleLabel.textContent!==selectedLabel)changed=true;
     if (changed) try { win.jQuery?.(select)?.selectmenu?.("refresh"); } catch (_) {}
+    // A native refresh can replace the widget after its options were already updated.
+    if(hostedMode && visibleLabel && selectedLabel)visibleLabel.textContent=selectedLabel;
     // Keep the share URL free from an obsolete official/hosted page preference;
     // the host's live lobby state is what selects the mode now.
     const link = document.getElementById("team-share-link");
@@ -1213,7 +1250,12 @@
     const relabel = () => {
       refreshMeasuredPings();
       installSpectatorChat();
-      refreshSpectatorChat();
+      refreshSpectatorChat();refreshJoinButton();
+      if(spectatorChatSocket?.readyState===1 && ["kicked-inactivity","connection-lost"].some(id=>{const e=document.getElementById(id);return e && e.style.display==="block";}))spectatorChatSocket.close();
+      if(quickJoin && !quickJoinStarted && win.nitroclash && document.getElementById("homepage-loaded")?.style.display==="block") {
+        quickJoinStarted=true;
+        gameServerReady.then(()=>{changeNetworkMode(false,4);win.nitroclash.clickPlay();setTimeout(()=>{if(quickJoin)win.nitroclash.clickTutoButton();},300);});
+      }
       if (win.nitroclash && !win.__nc4v4InitialModeApplied &&
           document.getElementById("homepage-loaded")?.style.display === "block") {
         win.__nc4v4InitialModeApplied = true;
@@ -1294,7 +1336,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.15.2";
+    badge.textContent = "HOSTED 4v4 v3.17.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
