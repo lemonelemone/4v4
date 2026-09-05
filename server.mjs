@@ -16,13 +16,53 @@ const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
 const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
-const HIDDEN_SLOTS = new Set([8, 9]); // One unused slot per team => 4v4.
-const PLAYABLE_SLOTS = Object.freeze([0, 1, 2, 3, 4, 5, 6, 7]);
+const ALL_PLAYER_SLOTS = Object.freeze(Array.from({ length: CLIENT_SLOTS }, (_, slot) => slot));
 const PLAYER_RADIUS = 0.6103515625;
 const BALL_RADIUS = 0.9765625;
 const PLAYER_MAX_SPEED = 10;
 const PLAYER_BRAKE_STRENGTH = 0.005;
 const PLAYER_SPEED = 0.75;
+// SUPER NC tuning. These are deliberately grouped so the mode can be adjusted
+// without touching normal hosted 4v4. The stock 5v5 layout supplies ten places.
+const FAST_MODE_MAX_PLAYERS_PER_TEAM = 5;
+const FAST_MODE_PLAYER_ACCELERATION = 0.94;
+const FAST_MODE_PLAYER_MAX_SPEED = 12.4;
+const FAST_MODE_BOOST_MULTIPLIER = 2;
+const FAST_MODE_UNLIMITED_BOOST = true;
+const FAST_MODE_BALL_LINEAR_DAMPING = 0.27;
+const FAST_MODE_BALL_RESTITUTION = 1.08;
+const FAST_MODE_MATCH_SECONDS = 180;
+const FAST_MODE_GOAL_RESET_MS = 300;
+const FAST_MODE_KICKOFF_EXTRA_MS = 600;
+const FAST_MODE_GOAL_LINE_RIGHT_X = 91.3;
+const FAST_MODE_GOAL_LINE_LEFT_X = 8.7;
+const NORMAL_RULES = Object.freeze({
+  id: "normal", maxPlayersPerTeam: 4, playerAcceleration: PLAYER_SPEED,
+  playerMaxSpeed: PLAYER_MAX_SPEED, boostMultiplier: 2, unlimitedBoost: false,
+  ballLinearDamping: 0.4, ballRestitution: 1, matchSeconds: MATCH_SECONDS,
+  regulationTicks: MATCH_SECONDS * PHYSICS_HZ, goalResetMs: null,
+  kickoffExtraMs: 0,
+  goalLineRightX: 92.1875, goalLineLeftX: 7.8125,
+});
+const FAST_RULES = Object.freeze({
+  id: "fast", maxPlayersPerTeam: FAST_MODE_MAX_PLAYERS_PER_TEAM,
+  playerAcceleration: FAST_MODE_PLAYER_ACCELERATION,
+  playerMaxSpeed: FAST_MODE_PLAYER_MAX_SPEED,
+  boostMultiplier: FAST_MODE_BOOST_MULTIPLIER,
+  unlimitedBoost: FAST_MODE_UNLIMITED_BOOST,
+  ballLinearDamping: FAST_MODE_BALL_LINEAR_DAMPING,
+  ballRestitution: FAST_MODE_BALL_RESTITUTION,
+  matchSeconds: FAST_MODE_MATCH_SECONDS,
+  regulationTicks: FAST_MODE_MATCH_SECONDS * PHYSICS_HZ,
+  goalResetMs: FAST_MODE_GOAL_RESET_MS,
+  kickoffExtraMs: FAST_MODE_KICKOFF_EXTRA_MS,
+  goalLineRightX: FAST_MODE_GOAL_LINE_RIGHT_X,
+  goalLineLeftX: FAST_MODE_GOAL_LINE_LEFT_X,
+});
+const rulesForMode = mode => mode === "fast" ? FAST_RULES : NORMAL_RULES;
+const kickoffCountdownMs = (world, baseMs = 4000) => baseMs + (world.rules.kickoffExtraMs || 0);
+const playableSlotsForRules = rules => ALL_PLAYER_SLOTS.filter(slot => Math.floor(slot / 2) < rules.maxPlayersPerTeam);
+const isPlayableSlot = (world, slot) => slot >= 0 && slot < CLIENT_SLOTS && Math.floor(slot / 2) < world.rules.maxPlayersPerTeam;
 const GOAL_MIN_Y = 23.4375;
 const GOAL_MAX_Y = 32.8125;
 const GOAL_CENTRE_Y = (GOAL_MIN_Y + GOAL_MAX_Y) / 2;
@@ -58,15 +98,15 @@ const KICKOFF_PAD_PAIRS = [
   [{ x: 27.2748, y: 42.6707, angle: -0.5694 }, { x: 72.7252, y: 42.6707, angle: -2.5722 }],
 ];
 
-function randomKickoffSpawns() {
+function randomKickoffSpawns(playersPerTeam = 4) {
   const pairs = KICKOFF_PAD_PAIRS.slice();
   for (let index = pairs.length - 1; index > 0; index--) {
     const other = Math.floor(Math.random() * (index + 1));
     [pairs[index], pairs[other]] = [pairs[other], pairs[index]];
   }
-  // Four randomly selected official pad pairs. Every blue position retains
+  // Select the requested official pad pairs. Every blue position retains
   // its exact mirrored red counterpart, without forcing vertical symmetry.
-  return pairs.slice(0, 4).flatMap((pair) => pair);
+  return pairs.slice(0, playersPerTeam).flatMap((pair) => pair);
 }
 const MAP_BORDERS = [
   [4.345703,23.4375,7.8125,23.4375,8.747321,23.065054,9.35389,22.033329,9.3727455,21.784855,9.375,15.625,9.419886,14.341579,9.554507,13.087652,9.77882,11.872826,10.092774,10.70671,10.496322,9.598909,10.989413,8.559029,11.572,7.5966754,12.244037,6.721461,13.005472,5.942987,13.856259,5.270861,14.796352,4.7146916,15.825697,4.284084,16.944252,3.988645,18.151962,3.8379812,18.762207,3.819908,34.470215,3.9541852,50.3125,3.880943],
@@ -155,7 +195,8 @@ function readString(buffer, offset) {
   return { value, offset };
 }
 
-function makeWorld() {
+function makeWorld(gameMode = "normal") {
+  const rules = rulesForMode(gameMode);
   const physics = new planck.World();
   const boundary = physics.createBody();
   for (const points of MAP_BORDERS) {
@@ -163,9 +204,9 @@ function makeWorld() {
     for (let i = 0; i < points.length; i += 2) vertices.push(new planck.Vec2(points[i], points[i + 1]));
     boundary.createFixture(new planck.Chain(vertices), { restitution: 0.2, friction: 0.6 });
   }
-  const kickoffSpawns = randomKickoffSpawns();
+  const kickoffSpawns = randomKickoffSpawns(rules.maxPlayersPerTeam);
   const players = Array.from({ length: CLIENT_SLOTS }, (_, slot) => {
-    const hidden = HIDDEN_SLOTS.has(slot);
+    const hidden = !isPlayableSlot({ rules }, slot);
     const spawn = hidden ? { x: -100, y: -100, angle: slot % 2 === 0 ? 0 : Math.PI } : kickoffSpawns[slot];
     const { x, y: py, angle } = spawn;
     const body = hidden ? null : physics.createDynamicBody({ position: new planck.Vec2(x, py), angle, angularDamping: 0.5 });
@@ -179,11 +220,11 @@ function makeWorld() {
     energy: 100,
     aim: angle,
     flags: 0,
-    name: HIDDEN_SLOTS.has(slot) ? "" : `Local ${slot + 1}`,
+    name: hidden ? "" : `Local ${slot + 1}`,
   }; });
-  const ballBody = physics.createDynamicBody({ position: new planck.Vec2(50, 28.125), linearDamping: 0.4, angularDamping: 0.2 });
+  const ballBody = physics.createDynamicBody({ position: new planck.Vec2(50, 28.125), linearDamping: rules.ballLinearDamping, angularDamping: 0.2 });
   ballBody.setUserData({ type: "ball" });
-  ballBody.createFixture(new planck.Circle(BALL_RADIUS), { density: 0.005 / 1.2, friction: 0.4, restitution: 1 });
+  ballBody.createFixture(new planck.Circle(BALL_RADIUS), { density: 0.005 / 1.2, friction: 0.4, restitution: rules.ballRestitution });
   const touches = [];
   const pendingTouches = [];
   physics.on("begin-contact", (contact) => {
@@ -205,6 +246,8 @@ function makeWorld() {
     replayTurnOffset: 0,
     state: 2,
     physics,
+    gameMode: rules.id,
+    rules,
     players,
     ball: { body: ballBody },
     touches,
@@ -235,11 +278,11 @@ function bodyState(entity) {
   };
 }
 
-function mapPacket() {
+function mapPacket(world = null) {
   const buffer = Buffer.alloc(11 + BOOSTS.length * 4);
   buffer[0] = 2;
   buffer.writeInt32BE(1, 1);
-  buffer.writeInt32BE(MATCH_SECONDS, 5);
+  buffer.writeInt32BE(world?.rules?.matchSeconds ?? MATCH_SECONDS, 5);
   buffer[9] = BOOSTS.length / 2;
   BOOSTS.forEach((value, index) => buffer.writeFloatBE(value, 10 + index * 4));
   buffer[10 + BOOSTS.length * 4] = 4; // Stock 5v5 mode; two slots are hidden.
@@ -330,7 +373,16 @@ function goalPacket(world, team, scorer, assist, speed) {
   buffer[6] = scorer;
   buffer[7] = assist;
   buffer.writeFloatBE(speed, 8);
-  buffer.writeInt32BE(CELEBRATION_TICKS * 1000 / PHYSICS_HZ, 12);
+  buffer.writeInt32BE(world.rules.goalResetMs ?? CELEBRATION_TICKS * 1000 / PHYSICS_HZ, 12);
+  return buffer;
+}
+
+function scoreSyncPacket(world) {
+  const buffer = Buffer.alloc(6);
+  buffer[0] = 26;
+  buffer[1] = 5;
+  buffer.writeUInt16BE(world.scores[0], 2);
+  buffer.writeUInt16BE(world.scores[1], 4);
   return buffer;
 }
 
@@ -392,7 +444,7 @@ function recordReplayEvent(world, type, slot1 = 255, slot2 = 255, speed = 0, nam
 }
 
 function awardPoints(world, slot, type, points = ACTION_POINTS[type] || 0, useCooldown = false) {
-  if (slot < 0 || slot >= CLIENT_SLOTS || HIDDEN_SLOTS.has(slot)) return null;
+  if (!isPlayableSlot(world, slot)) return null;
   if (useCooldown) {
     const key = `${slot}:${type}`;
     const lastTurn = world.awardCooldowns.get(key) ?? -Infinity;
@@ -497,7 +549,7 @@ function buildNcrReplay(connection) {
     : [ncrFrameFromStatePacket(statePacket(connection.world), connection.world.boosts)];
   const header = Buffer.alloc(13);
   header.writeInt32BE(1, 0); // NCR format version
-  header[4] = 4; // Stock 5v5 layout, with slots 8 and 9 filtered by the userscript.
+  header[4] = 4; // Stock 5v5 layout; normal 4v4 leaves slots 8 and 9 unused.
   header.writeInt32BE(0, 5); // Standard map
   header.writeInt32BE(frames.length, 9);
   const events = connection.world.replayEvents.map(ncrEventBuffer);
@@ -525,10 +577,10 @@ function detectGoal(world) {
   const ball = bodyState(world.ball);
   if (ball.y < GOAL_MIN_Y || ball.y > GOAL_MAX_Y) return null;
   let team;
-  if (ball.x <= 7.8125) team = 1;
-  else if (ball.x >= 92.1875) team = 0;
+  if (ball.x <= world.rules.goalLineLeftX) team = 1;
+  else if (ball.x >= world.rules.goalLineRightX) team = 0;
   else return null;
-  const recent = world.touches.filter((touch) => touch.slot % 2 === team && !HIDDEN_SLOTS.has(touch.slot) && world.players[touch.slot]?.body?.isActive() && Date.now() - touch.time <= 15000);
+  const recent = world.touches.filter((touch) => touch.slot % 2 === team && isPlayableSlot(world, touch.slot) && world.players[touch.slot]?.body?.isActive() && Date.now() - touch.time <= 15000);
   const scorer = recent.length ? recent[recent.length - 1].slot : 255;
   const scoringTouch = recent.length ? recent[recent.length - 1] : null;
   let assist = 255;
@@ -540,8 +592,8 @@ function detectGoal(world) {
   return { team, scorer, assist, speed: Math.hypot(ball.vx, ball.vy), longGoal };
 }
 
-function resetForKickoff(world, kickoffSpawns = randomKickoffSpawns()) {
-  for (let slot = 0; slot < 8; slot++) {
+function resetForKickoff(world, kickoffSpawns = randomKickoffSpawns(world.rules.maxPlayersPerTeam)) {
+  for (const slot of playableSlotsForRules(world.rules)) {
     const player = world.players[slot];
     const spawn = kickoffSpawns[slot];
     player.body.setTransform(new planck.Vec2(spawn.x, spawn.y), spawn.angle);
@@ -591,7 +643,7 @@ function processBallTouches(world) {
       world.activeShot = null;
     }
 
-    const goalX = team === 0 ? 92.1875 : 7.8125;
+    const goalX = team === 0 ? world.rules.goalLineRightX : world.rules.goalLineLeftX;
     const movingTowardGoal = ball.vx * direction > 1.5;
     const secondsToLine = movingTowardGoal ? (goalX - ball.x) / ball.vx : -1;
     const projectedY = secondsToLine > 0 ? ball.y + ball.vy * secondsToLine : Infinity;
@@ -610,22 +662,23 @@ function simulate(world) {
   const events = [];
   world.turn++;
   for (let slot = 0; slot < world.players.length; slot++) {
-    if (HIDDEN_SLOTS.has(slot)) continue;
+    if (!isPlayableSlot(world, slot)) continue;
     const player = world.players[slot];
     const body = player.body;
     if (!body?.isActive()) continue;
-    if (player.energy < 1) player.flags &= ~1;
-    const boost = Boolean(player.flags & 1) && player.energy >= 1;
+    if (!world.rules.unlimitedBoost && player.energy < 1) player.flags &= ~1;
+    const boost = Boolean(player.flags & 1) && (world.rules.unlimitedBoost || player.energy >= 1);
     const brake = Boolean(player.flags & 2);
-    const impulse = PLAYER_SPEED / 60 * 1.5;
+    const impulse = world.rules.playerAcceleration / 60 * 1.5;
     if (brake) {
       const braking = body.getLinearVelocity().clone().mul(-PLAYER_BRAKE_STRENGTH * 1.5);
       body.applyLinearImpulse(braking, body.getPosition(), true);
     } else {
-      if (boost) {
+      if (boost && !world.rules.unlimitedBoost) {
         player.energy = Math.max(0, player.energy - 1);
         if (player.energy < 1) player.flags &= ~1;
       }
+      if (world.rules.unlimitedBoost) player.energy = 100;
       const velocity = body.getLinearVelocity();
       const velocityAngle = Math.atan2(velocity.y, velocity.x);
       const delta = angleDifference(player.aim, velocityAngle);
@@ -637,8 +690,9 @@ function simulate(world) {
       else movementAngle = delta > -Math.PI / 2
         ? player.aim + correction * angleDifference(velocityAngle, player.aim)
         : player.aim - correction * angleDifference(velocityAngle + Math.PI, player.aim);
-      const thrust = new planck.Vec2(Math.cos(movementAngle) * impulse * (boost ? 2 : 1), Math.sin(movementAngle) * impulse * (boost ? 2 : 1));
-      const maxSpeed = PLAYER_MAX_SPEED * (boost ? 2 : 1);
+      const boostMultiplier = boost ? world.rules.boostMultiplier : 1;
+      const thrust = new planck.Vec2(Math.cos(movementAngle) * impulse * boostMultiplier, Math.sin(movementAngle) * impulse * boostMultiplier);
+      const maxSpeed = world.rules.playerMaxSpeed * boostMultiplier;
       if (velocity.length() > maxSpeed) {
         body.applyLinearImpulse(velocity.clone().mul(-0.01 * impulse), body.getPosition(), true);
       }
@@ -713,7 +767,7 @@ function parkSlot(arena, slot) {
 
 function activateSlot(arena, slot, username, savedState = null) {
   const player = arena.world.players[slot];
-  const spawn = savedState || arena.kickoffSpawns[slot] || randomKickoffSpawns()[slot];
+  const spawn = savedState || arena.kickoffSpawns[slot] || randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam)[slot];
   player.body.setActive(true);
   player.body.setTransform(new planck.Vec2(spawn.x, spawn.y), spawn.angle ?? (slot % 2 ? Math.PI : 0));
   player.body.setLinearVelocity(new planck.Vec2(savedState?.vx || 0, savedState?.vy || 0));
@@ -727,17 +781,18 @@ function activateSlot(arena, slot, username, savedState = null) {
   player.name = String(username || "Player").slice(0, 12);
 }
 
-function createArena({ kind = "public", partyCode = null } = {}) {
-  const world = makeWorld();
+function createArena({ kind = "public", partyCode = null, gameMode = "normal" } = {}) {
+  const world = makeWorld(gameMode);
   const arena = {
     id: nextArenaId++,
     world,
-    kickoffSpawns: randomKickoffSpawns(),
+    kickoffSpawns: randomKickoffSpawns(world.rules.maxPlayersPerTeam),
     connections: new Map(),
     spectators: new Set(),
     reservedSlots: new Map(),
     kind,
     partyCode,
+    gameMode: world.gameMode,
     started: false,
     startsAt: 0,
     loopTimer: null,
@@ -755,15 +810,19 @@ function createArena({ kind = "public", partyCode = null } = {}) {
     lastReplayTurn: -1,
     cachedReplay: null,
   };
-  for (const slot of PLAYABLE_SLOTS) parkSlot(arena, slot);
+  for (const slot of playableSlotsForRules(world.rules)) parkSlot(arena, slot);
   arenas.set(arena.id, arena);
-  if (kind === "private") privateArenas.set(partyCode, arena);
-  console.log(`${kind === "private" ? `Private party ${partyCode}` : "Public"} arena ${arena.id} created`);
+  if (kind === "private") privateArenas.set(`${world.gameMode}:${partyCode}`, arena);
+  console.log(`${kind === "private" ? `Private party ${partyCode}` : "Public"} ${world.gameMode} arena ${arena.id} created`);
   return arena;
 }
 
+function playableSlots(arena) {
+  return playableSlotsForRules(arena.world.rules);
+}
+
 function freeSlots(arena) {
-  return PLAYABLE_SLOTS.filter((slot) => !arena.connections.has(slot) && !arena.reservedSlots.has(slot));
+  return playableSlots(arena).filter((slot) => !arena.connections.has(slot) && !arena.reservedSlots.has(slot));
 }
 
 function chooseBalancedSlot(arena, preferredTeam = null) {
@@ -780,14 +839,15 @@ function chooseBalancedSlot(arena, preferredTeam = null) {
   return free.find((slot) => slot % 2 === targetTeam) ?? free[0];
 }
 
-function getOpenArena() {
-  return [...arenas.values()].find((arena) => arena.kind === "public" && arena.phase !== "ended" && arena.phase !== "retired" && freeSlots(arena).length) || createArena();
+function getOpenArena(gameMode = "normal") {
+  return [...arenas.values()].find((arena) => arena.kind === "public" && arena.gameMode === gameMode && arena.phase !== "ended" && arena.phase !== "retired" && freeSlots(arena).length) || createArena({ gameMode });
 }
 
-function getPrivateArena(partyCode) {
-  const existing = privateArenas.get(partyCode);
+function getPrivateArena(partyCode, gameMode = "normal") {
+  const key = `${gameMode}:${partyCode}`;
+  const existing = privateArenas.get(key);
   if (existing && existing.phase !== "ended" && existing.phase !== "retired") return existing;
-  return createArena({ kind: "private", partyCode });
+  return createArena({ kind: "private", partyCode, gameMode });
 }
 
 function arenaSend(arena, payload, opcode = 2) {
@@ -799,13 +859,13 @@ function arenaSend(arena, payload, opcode = 2) {
   }
 }
 
-function getSpectatorArena() {
-  return spectatorArenas()[0] || null;
+function getSpectatorArena(gameMode = "normal") {
+  return spectatorArenas(gameMode)[0] || null;
 }
 
-function spectatorArenas() {
+function spectatorArenas(gameMode = null) {
   return [...arenas.values()]
-    .filter((arena) => arena.kind === "public" && arena.phase !== "ended" &&
+    .filter((arena) => arena.kind === "public" && (!gameMode || arena.gameMode === gameMode) && arena.phase !== "ended" &&
       arena.phase !== "retired" && arena.connections.size > 0)
     .sort((left, right) => right.connections.size - left.connections.size || left.id - right.id);
 }
@@ -863,7 +923,7 @@ function finishArena(arena) {
   const winner = arena.world.scores[0] > arena.world.scores[1] ? 0 : 1;
   const winnerSlots = arena.world.stats
     .map((stats, slot) => ({ stats, slot }))
-    .filter(({ slot }) => !HIDDEN_SLOTS.has(slot) && slot % 2 === winner)
+    .filter(({ slot }) => isPlayableSlot(arena.world, slot) && slot % 2 === winner)
     .sort((a, b) => b.stats.points - a.stats.points || a.slot - b.slot);
   recordReplayEvent(arena.world, ACTION.VICTORY, winnerSlots[0]?.slot ?? winner, 255, 0, "");
   arena.phase = "ended";
@@ -899,25 +959,26 @@ function resumeGoalClock(world) {
 function completeGoalReplay(arena) {
   resumeGoalClock(arena.world);
   arena.replaySkipVotes.clear();
-  if (arena.world.turn >= REGULATION_TICKS && arena.world.scores[0] !== arena.world.scores[1]) {
+  if (arena.world.turn >= arena.world.rules.regulationTicks && arena.world.scores[0] !== arena.world.scores[1]) {
     arena.world.regulationFinished = true;
     finishArena(arena);
     return null;
   }
-  if (arena.world.turn >= REGULATION_TICKS) {
+  if (arena.world.turn >= arena.world.rules.regulationTicks) {
     arena.world.regulationFinished = true;
     arena.world.overtime = true;
-    arena.world.turn = Math.max(arena.world.turn, REGULATION_TICKS + 1);
+    arena.world.turn = Math.max(arena.world.turn, arena.world.rules.regulationTicks + 1);
     recordReplayEvent(arena.world, 203);
   }
-  arena.kickoffSpawns = randomKickoffSpawns();
+  arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
   resetForKickoff(arena.world, arena.kickoffSpawns);
-  for (const slot of PLAYABLE_SLOTS) if (!arena.connections.has(slot)) parkSlot(arena, slot);
+  for (const slot of playableSlots(arena)) if (!arena.connections.has(slot)) parkSlot(arena, slot);
   arena.phase = "playing";
   arena.history = [];
   arena.replayFrames = [];
-  arena.startsAt = Date.now() + 4000;
-  arenaSend(arena, startPacket(arena.world));
+  const countdownMs = kickoffCountdownMs(arena.world);
+  arena.startsAt = Date.now() + countdownMs;
+  arenaSend(arena, startPacket(arena.world, countdownMs));
   const snapshot = statePacket(arena.world);
   arenaSend(arena, snapshot);
   return snapshot;
@@ -956,8 +1017,8 @@ function retireEmptyArena(arena) {
   arena.rematchTimer = null;
   arena.phase = "retired";
   arenas.delete(arena.id);
-  if (arena.kind === "private" && privateArenas.get(arena.partyCode) === arena)
-    privateArenas.delete(arena.partyCode);
+  if (arena.kind === "private" && privateArenas.get(`${arena.gameMode}:${arena.partyCode}`) === arena)
+    privateArenas.delete(`${arena.gameMode}:${arena.partyCode}`);
   for (const [key, saved] of reconnectSessions) {
     if (saved.arenaId === arena.id) reconnectSessions.delete(key);
   }
@@ -992,12 +1053,16 @@ function runArenaTick(arena) {
           const goalActions = recordGoal(arena.world, goal);
           arena.world.state = 4;
           arenaSend(arena, goalPacket(arena.world, goal.team, goal.scorer, goal.assist, goal.speed));
+          arenaSend(arena, scoreSyncPacket(arena.world));
           for (const action of goalActions) arenaSend(arena, action);
           arenaSend(arena, arenaStatsPacket(arena));
           const assistText = goal.assist === 255 ? "no assist" : `assisted by slot ${goal.assist + 1}`;
           console.log(`Arena ${arena.id}: ${goal.team === 0 ? "Blue" : "Red"} goal — ${goal.scorer === 255 ? "uncredited scorer" : `scored by slot ${goal.scorer + 1}`}, ${assistText}`);
           if (arena.world.overtime) {
             finishArena(arena);
+          } else if (arena.world.rules.goalResetMs !== null) {
+            arena.phase = "fast-goal-reset";
+            arena.phaseTicks = 0;
           } else {
             arena.phase = "celebration";
             arena.phaseTicks = 0;
@@ -1005,23 +1070,43 @@ function runArenaTick(arena) {
             while (arena.replayFrames.length < REPLAY_TICKS)
               arena.replayFrames.unshift(arena.replayFrames[0] || recorded);
           }
-        } else if (!arena.world.regulationFinished && arena.world.turn >= REGULATION_TICKS) {
+        } else if (!arena.world.regulationFinished && arena.world.turn >= arena.world.rules.regulationTicks) {
           arena.world.regulationFinished = true;
           if (arena.world.scores[0] === arena.world.scores[1]) {
             arena.world.overtime = true;
-            arena.world.turn = Math.max(arena.world.turn, REGULATION_TICKS + 1);
+            arena.world.turn = Math.max(arena.world.turn, arena.world.rules.regulationTicks + 1);
             recordReplayEvent(arena.world, 203);
-            arena.kickoffSpawns = randomKickoffSpawns();
+            arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
             resetForKickoff(arena.world, arena.kickoffSpawns);
-            for (const slot of PLAYABLE_SLOTS) if (!arena.connections.has(slot)) parkSlot(arena, slot);
+            for (const slot of playableSlots(arena)) if (!arena.connections.has(slot)) parkSlot(arena, slot);
             arena.history = [];
-            arena.startsAt = Date.now() + 4000;
-            arenaSend(arena, startPacket(arena.world));
+            const countdownMs = kickoffCountdownMs(arena.world);
+            arena.startsAt = Date.now() + countdownMs;
+            arenaSend(arena, startPacket(arena.world, countdownMs));
           } else {
             finishArena(arena);
           }
         }
         snapshot = arena.phase === "ended" ? null : statePacket(arena.world);
+      } else if (arena.phase === "fast-goal-reset") {
+        arena.world.state = 4;
+        arena.phaseTicks++;
+        snapshot = statePacket(arena.world);
+        saveArenaReplayFrame(arena, snapshot);
+        if (arena.phaseTicks >= Math.round(arena.world.rules.goalResetMs / TICK_MS)) {
+          resumeGoalClock(arena.world);
+          arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
+          resetForKickoff(arena.world, arena.kickoffSpawns);
+          for (const slot of playableSlots(arena)) if (!arena.connections.has(slot)) parkSlot(arena, slot);
+          arena.phase = "playing";
+          arena.history = [];
+          arena.replayFrames = [];
+          const countdownMs = kickoffCountdownMs(arena.world, 0);
+          arena.startsAt = Date.now() + countdownMs;
+          arenaSend(arena, startPacket(arena.world, countdownMs));
+          snapshot = statePacket(arena.world);
+          arenaSend(arena, snapshot);
+        }
       } else if (arena.phase === "celebration") {
         arena.world.state = 4;
         applyArenaInputs(arena);
@@ -1066,6 +1151,7 @@ function runArenaTick(arena) {
       for (const connection of [...arena.connections.values(), ...arena.spectators])
         if (connection.ready && !connection.cleaned) probeConnectionPing(connection);
       arenaSend(arena, arenaStatsPacket(arena));
+      if (arena.gameMode === "fast") arenaSend(arena, scoreSyncPacket(arena.world));
     }
     if (arena.phase !== "ended" && arena.networkTick % SNAPSHOT_EVERY_TICKS === 0)
       arenaSend(arena, snapshot || statePacket(arena.world));
@@ -1080,8 +1166,9 @@ function runArenaTick(arena) {
 function startArena(arena) {
   if (arena.started) return;
   arena.started = true;
-  arena.startsAt = Date.now() + 4000;
-  for (const slot of PLAYABLE_SLOTS) {
+  const countdownMs = kickoffCountdownMs(arena.world);
+  arena.startsAt = Date.now() + countdownMs;
+  for (const slot of playableSlots(arena)) {
     const name = arena.world.players[slot].name;
     if (name) recordReplayEvent(arena.world, 200, slot, 255, 0, name);
   }
@@ -1089,8 +1176,9 @@ function startArena(arena) {
   saveArenaReplayFrame(arena, initial);
   for (const connection of arena.connections.values()) {
     if (!connection.ready) continue;
-    connection.send(startPacket(arena.world));
+    connection.send(startPacket(arena.world, countdownMs));
     connection.send(arenaStatsPacket(arena));
+    if (arena.gameMode === "fast") connection.send(scoreSyncPacket(arena.world));
     connection.send(initial);
   }
   arena.nextTickAt = performance.now() + TICK_MS;
@@ -1111,6 +1199,7 @@ function rememberReconnectSession(connection, arena, slot, playerState) {
   const saved = {
     kind: arena.kind,
     partyCode: arena.partyCode,
+    gameMode: arena.gameMode,
     arenaId: arena.id,
     slot,
     username: connection.username,
@@ -1132,7 +1221,7 @@ function assignPublicConnection(connection) {
   let reconnect = false;
   if(connection.joinArenaId) {
     const target=arenas.get(connection.joinArenaId);
-    if(!target || target.kind!=="public" || target.phase==="ended" || target.phase==="retired")return {error:"That public match is no longer available"};
+    if(!target || target.kind!=="public" || target.gameMode!==connection.gameMode || target.phase==="ended" || target.phase==="retired")return {error:"That public match is no longer available"};
     const place=chooseBalancedSlot(target);if(place===null)return {error:"That match filled up; please spectate and try again"};
     connection.arena=target;connection.slot=place;connection.resuming=false;
     target.connections.set(place,connection);activeReservations.set(connection.reservationKey,connection);
@@ -1144,7 +1233,7 @@ function assignPublicConnection(connection) {
     if (saved) releaseReconnectSession(connection.reservationKey, saved);
     return { error: "Reconnect expired" };
   }
-  if (saved && saved.kind === "public" && saved.expiresAt > now && saved.username === connection.username) {
+  if (saved && saved.kind === "public" && saved.gameMode === connection.gameMode && saved.expiresAt > now && saved.username === connection.username) {
     arena = arenas.get(saved.arenaId);
     if (arena?.kind === "public" && arena.phase !== "ended" && arena.phase !== "retired") {
       if (!arena.connections.has(saved.slot)) slot = saved.slot;
@@ -1163,7 +1252,7 @@ function assignPublicConnection(connection) {
       if (candidate.kind === "public" && candidate.started && candidate.connections.size === 0)
         retireEmptyArena(candidate);
     }
-    arena = getOpenArena();
+    arena = getOpenArena(connection.gameMode);
     slot = chooseBalancedSlot(arena);
   }
   if (slot === null) return { error: "no public slot available" };
@@ -1184,7 +1273,7 @@ function assignPrivateConnection(connection) {
   let restoredState = null;
   let reconnect = false;
   const saved = reconnectSessions.get(connection.reservationKey);
-  const validSaved = saved && saved.kind === "private" && saved.partyCode === connection.partyCode &&
+  const validSaved = saved && saved.kind === "private" && saved.partyCode === connection.partyCode && saved.gameMode === connection.gameMode &&
     saved.expiresAt > now && saved.username === connection.username;
   if (connection.reconnectRequested && !validSaved) {
     if (saved) releaseReconnectSession(connection.reservationKey, saved);
@@ -1207,7 +1296,7 @@ function assignPrivateConnection(connection) {
     }
   }
   if (saved) releaseReconnectSession(connection.reservationKey, saved, !reconnect);
-  if (!arena) arena = getPrivateArena(connection.partyCode);
+  if (!arena) arena = getPrivateArena(connection.partyCode, connection.gameMode);
   if (slot === null) {
     const free = freeSlots(arena);
     if (connection.requestedTeam === 0 || connection.requestedTeam === 1)
@@ -1250,14 +1339,15 @@ function sendSpectatorEntry(connection, arena) {
   connection.send(Buffer.from([11, 9, 0]));
   connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now())));
   connection.send(arenaStatsPacket(arena));
+  if (arena.gameMode === "fast") connection.send(scoreSyncPacket(arena.world));
   connection.send(statePacket(arena.world));
   if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
 }
 
 function changeSpectatedArena(connection, direction) {
   if (connection.inGameSpectator) return;
-  const available = spectatorArenas();
-  if (!available.length) return connection.close("No active 4v4 games");
+  const available = spectatorArenas(connection.gameMode);
+  if (!available.length) return connection.close("No active hosted games in this mode");
   const currentIndex = available.indexOf(connection.arena);
   const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + available.length) % available.length;
   const nextArena = available[nextIndex];
@@ -1268,7 +1358,7 @@ function changeSpectatedArena(connection, direction) {
     nextArena.spectators.add(connection);
   }
   sendSpectatorEntry(connection, nextArena);
-  console.log(`Spectator switched to public arena ${nextArena.id} (${nextArena.connections.size}/8 players)`);
+  console.log(`Spectator switched to public arena ${nextArena.id} (${nextArena.connections.size}/${playableSlots(nextArena).length} players)`);
 }
 
 function changeConnectionMatch(connection) {
@@ -1367,10 +1457,10 @@ function completeArenaRematch(arena) {
     return false;
   }
 
-  arena.world = makeWorld();
+  arena.world = makeWorld(arena.gameMode);
   for (const watcher of arena.spectators) if (watcher.inGameSpectator) placeInGameSpectator(watcher);
-  arena.kickoffSpawns = randomKickoffSpawns();
-  for (const slot of PLAYABLE_SLOTS) parkSlot(arena, slot);
+  arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
+  for (const slot of playableSlots(arena)) parkSlot(arena, slot);
   for (const [slot, connection] of staying) {
     connection.pendingInput = null;
     connection.lastInputFlags = 0;
@@ -1390,12 +1480,14 @@ function completeArenaRematch(arena) {
     arena.fullReplayFrames = [];
   arena.lastReplayTurn = -1;
   arena.cachedReplay = null;
-  arena.startsAt = Date.now() + 4000;
+  const countdownMs = kickoffCountdownMs(arena.world);
+  arena.startsAt = Date.now() + countdownMs;
 
   const initial = statePacket(arena.world);
   saveArenaReplayFrame(arena, initial);
-  arenaSend(arena, startPacket(arena.world));
+  arenaSend(arena, startPacket(arena.world, countdownMs));
   arenaSend(arena, arenaStatsPacket(arena));
+  if (arena.gameMode === "fast") arenaSend(arena, scoreSyncPacket(arena.world));
   arenaSend(arena, initial);
   arena.nextTickAt = performance.now() + TICK_MS;
   arena.loopTimer = setTimeout(() => runArenaTick(arena), TICK_MS);
@@ -1435,13 +1527,13 @@ function handleSpectatorChat(connection, packet) {
   }
 }
 
-function onlinePlayerCount() {
+function onlinePlayerCount(gameMode = null) {
   let count=0;
-  for(const arena of arenas.values())for(const c of arena.connections.values())if(c.ready && !c.cleaned)count++;
+  for(const arena of arenas.values())if(!gameMode || arena.gameMode===gameMode)for(const c of arena.connections.values())if(c.ready && !c.cleaned)count++;
   return count;
 }
-function populationPingPacket() {
-  const packet=Buffer.alloc(5);packet[0]=99;packet.writeUInt32BE(onlinePlayerCount(),1);return packet;
+function populationPingPacket(gameMode = null) {
+  const packet=Buffer.alloc(5);packet[0]=99;packet.writeUInt32BE(onlinePlayerCount(gameMode),1);return packet;
 }
 function placeInGameSpectator(connection) {
   const player = connection.arena.world.players[connection.slot];
@@ -1470,7 +1562,8 @@ function moveInGameSpectators(arena) {
 
 function joinInGameSpectator(connection) {
   if (connection.kind === "private") return connection.close("In-game spectate is public matches only");
-  for (const arena of spectatorArenas()) {
+  if (connection.gameMode === "fast") return connection.close("SUPER NC uses all ten slots for players; use normal spectating instead");
+  for (const arena of spectatorArenas(connection.gameMode)) {
     const occupied = new Set([...arena.spectators].filter(c => c.inGameSpectator).map(c => c.slot));
     const slot = [8, 9].find(slot => !occupied.has(slot));
     if (slot === undefined) continue;
@@ -1480,7 +1573,7 @@ function joinInGameSpectator(connection) {
     arena.spectators.add(connection);
     placeInGameSpectator(connection);
     arenaSend(arena, namePacket(slot, connection.username));
-    connection.send(mapPacket());
+    connection.send(mapPacket(arena.world));
     return;
   }
   connection.close("No in-game spectator spaces in active public matches");
@@ -1509,6 +1602,7 @@ function installSharedUpgradeHandler(serverInstance) {
     const reconnectRequested = upgradeUrl.searchParams.get("reconnect") === "1";
     const inGameSpectator = upgradeUrl.searchParams.get("ingameSpectate") === "1";
     const spectatorRequested = upgradeUrl.searchParams.get("spectate") === "1" || inGameSpectator;
+    const gameMode = upgradeUrl.searchParams.get("gameMode") === "fast" ? "fast" : "normal";
     const key = request.headers["sec-websocket-key"];
     if (!key) return socket.destroy();
     const accept = crypto.createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
@@ -1536,6 +1630,7 @@ function installSharedUpgradeHandler(serverInstance) {
       spectator: spectatorRequested,
       inGameSpectator,
       reconnectRequested,
+      gameMode,
       kind: privateParty ? "private" : "public",
       partyCode: privateParty ? requestedParty : null,
       requestedTeam: privateParty ? requestedTeam : null,
@@ -1593,7 +1688,7 @@ function installSharedUpgradeHandler(serverInstance) {
             }
             break;
           case 99:
-            connection.send(populationPingPacket());
+            connection.send(populationPingPacket(connection.gameMode));
             break;
           case 1: {
             if (connection.inGameSpectator && !connection.joined) {
@@ -1626,7 +1721,7 @@ function installSharedUpgradeHandler(serverInstance) {
             }
             connection.joined = true;
             console.log(`${assignment.reconnect ? "Reconnect" : "Join"} ${connection.username} → ${connection.kind}${connection.partyCode ? ` party ${connection.partyCode}` : ""}, arena ${assignment.arena.id}, slot ${assignment.slot + 1}`);
-            connection.send(mapPacket());
+            connection.send(mapPacket(assignment.arena.world));
             break;
           }
           case 7: {
@@ -1649,22 +1744,22 @@ function installSharedUpgradeHandler(serverInstance) {
                 connection.close("Private spectating is disabled");
                 break;
               }
-              const arena = getSpectatorArena();
+              const arena = getSpectatorArena(connection.gameMode);
               if (!arena) {
-                connection.close("No active 4v4 games");
+                connection.close("No active hosted games in this mode");
                 break;
               }
               connection.arena = arena;
               connection.joined = true;
               connection.ready = true;connection.lastActivityAt=Date.now();
               arena.spectators.add(connection);
-              connection.send(mapPacket());
+              connection.send(mapPacket(arena.world));
               // Unlike player clients, NitroClash's native spectator path does
               // not send opcode 3 after its ping sequence. The first match
               // must follow the map immediately; opcode 7 subcommands 2/3 are
               // reserved for switching to the next/previous match.
               sendSpectatorEntry(connection, arena);
-              console.log(`Spectator joined public arena ${arena.id} (${arena.connections.size}/8 players)`);
+              console.log(`Spectator joined public arena ${arena.id} (${arena.connections.size}/${playableSlots(arena).length} players)`);
             } else if (packet[1] === 2 && connection.joined) {
               changeSpectatedArena(connection, 1);
             } else if (packet[1] === 3 && connection.joined) {
@@ -1854,7 +1949,7 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
     const winner = connection.world.scores[0] > connection.world.scores[1] ? 0 : 1;
     const winnerSlots = connection.world.stats
       .map((stats, slot) => ({ stats, slot }))
-      .filter(({ slot }) => !HIDDEN_SLOTS.has(slot) && slot % 2 === winner)
+      .filter(({ slot }) => isPlayableSlot(connection.world, slot) && slot % 2 === winner)
       .sort((a, b) => b.stats.points - a.stats.points || a.slot - b.slot);
     recordReplayEvent(connection.world, ACTION.VICTORY, winnerSlots[0]?.slot ?? winner, 255, 0, "");
     connection.phase = "ended";
@@ -1892,7 +1987,7 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
           }
           connection.joined = true;
           console.log(`${connection.resuming ? "Reconnect" : "Join"} received from ${connection.username}`);
-          send(mapPacket());
+          send(mapPacket(connection.world));
           break;
         }
         case 2:
@@ -1915,7 +2010,7 @@ if (process.env.NC_LEGACY_SINGLEPLAYER === "1") server.on("upgrade", (request, s
           } else {
             send(startPacket(connection.world));
             for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
-              if (!HIDDEN_SLOTS.has(slot)) recordReplayEvent(connection.world, 200, slot, 255, 0, connection.world.players[slot].name);
+              if (isPlayableSlot(connection.world, slot)) recordReplayEvent(connection.world, 200, slot, 255, 0, connection.world.players[slot].name);
             }
             send(liveStatsPacket(connection.world));
             saveReplayFrame(statePacket(connection.world));
@@ -2131,8 +2226,10 @@ export {
   createArena,
   liveStatsPacket,
   makeWorld,
+  mapPacket,
   ncrFrameFromStatePacket,
   recordGoal,
+  scoreSyncPacket,
   registerRematchVote,
   registerReplaySkipVote,
   runArenaTick,
@@ -2147,6 +2244,8 @@ export {
   onlinePlayerCount,
   checkConnectionLifecycle,
   sendJoinAvailability,
+  simulate,
+  rulesForMode,
   server,
   statePacket,
 };

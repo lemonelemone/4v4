@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.17.1
-// @description  Connects NitroClash game sockets to the hosted 4v4 server
+// @version      3.24.5
+// @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
 // @downloadURL  https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -16,9 +16,11 @@
 (function () {
   "use strict";
   const win = unsafeWindow;
+  const FAST_MODE_BALL_SCALE = 1;
   if (win.top !== win.self) return;
   const initialUrl = new URL(win.location.href);
   let hostedMode = initialUrl.searchParams.get("ncMode") !== "official";
+  let hostedVariant = initialUrl.searchParams.get("ncMode") === "fast" ? "fast" : "normal";
   let selectedMode = hostedMode ? 4 : Number(initialUrl.searchParams.get("ncGameMode") ?? 4);
   if (!Number.isInteger(selectedMode) || selectedMode < 0 || selectedMode > 5) selectedMode = 4;
   const NativeWebSocket = win.WebSocket;
@@ -28,10 +30,52 @@
   let partyIsHost = true;
   let partyRegion = null;
   let hostedMatchActive = false;
-  let preferredHostedRegion = "NC4EU";
+  let hostedMatchVariant = "normal";
+  let superMatchSeconds = 180;
+  let superMatchTurn = 0;
+  let superScores = [0, 0];
+  let fastGoalOverlayCleared = true;
+  let fastGoalBannerUntil = 0;
+  let fastGoalClearTimer = null;
+  let latestGameStage = null;
+  let clearFastGoalOverlayNow = () => {};
+  function syncFastGoalDom() {
+    const root = document.documentElement;
+    if (!root) return;
+    if (!document.getElementById("nc-super-goal-style")) {
+      const style = document.createElement("style");
+      style.id = "nc-super-goal-style";
+      style.textContent = `
+        html.nc-super-match #goal,
+        html.nc-super-match #goal .bottom { display: none !important; }
+      `;
+      (document.head || root).appendChild(style);
+    }
+    const fastActive = hostedMatchActive && hostedMatchVariant === "fast";
+    root.classList.toggle("nc-super-match", fastActive);
+    root.classList.toggle("nc-super-goal-cleared", fastActive && fastGoalOverlayCleared);
+  }
+  function refreshSuperScoreboard() {
+    const scoreboard = document.getElementById("nc-super-scoreboard");
+    if (!scoreboard) return;
+    const homepage = document.getElementById("homepage");
+    const visible = hostedMatchActive && hostedMatchVariant === "fast" && homepage &&
+      (homepage.style.display === "none" || (win.getComputedStyle && win.getComputedStyle(homepage).display === "none"));
+    scoreboard.style.display = visible ? "flex" : "none";
+    const blue = scoreboard.querySelector?.("[data-nc-blue]");
+    const red = scoreboard.querySelector?.("[data-nc-red]");
+    const clock = scoreboard.querySelector?.("[data-nc-clock]");
+    if (!blue || !red || !clock) return;
+    blue.textContent = String(superScores[0]);
+    red.textContent = String(superScores[1]);
+    const remaining = Math.max(0, superMatchSeconds - Math.floor(superMatchTurn / 60));
+    clock.textContent = superMatchTurn > superMatchSeconds * 60
+      ? "OT" : `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+  }
+  let preferredHostedRegion = hostedVariant === "fast" ? "NCFEU" : "NC4EU";
   let preferredOfficialRegion = "EU1";
   let quickJoin=null,quickJoinStarted=false,joinOffer=null;
-  try{const saved=JSON.parse(win.sessionStorage.getItem("nc4v4-quick-join")||"null");if(saved?.expires>Date.now() && Number.isInteger(saved.arenaId) && saved.arenaId>0 && ["NC4EU","NC4OLD"].includes(saved.serverCode)){quickJoin=saved;hostedMode=true;selectedMode=4;preferredHostedRegion=saved.serverCode;}}catch(_){}
+  try{const saved=JSON.parse(win.sessionStorage.getItem("nc4v4-quick-join")||"null");if(saved?.expires>Date.now() && Number.isInteger(saved.arenaId) && saved.arenaId>0 && ["NC4EU","NC4OLD","NCFEU","NCFOLD"].includes(saved.serverCode)){quickJoin=saved;hostedMode=true;hostedVariant=saved.serverCode.startsWith("NCF")?"fast":"normal";selectedMode=4;preferredHostedRegion=saved.serverCode;}}catch(_){}
   let lastActivitySent=0,refreshingNativeActivity=false;
   function markGameActivity(){if(spectatorChatSocket?.readyState===1 && Date.now()-lastActivitySent>1000){lastActivitySent=Date.now();spectatorChatSocket.send(new Uint8Array([29]));
     if(document.activeElement?.id==="chat-input" && win.KeyboardEvent){refreshingNativeActivity=true;try{win.dispatchEvent(new win.KeyboardEvent("keydown",{key:"",keyCode:0,which:0}));}finally{refreshingNativeActivity=false;}}}}
@@ -42,17 +86,29 @@
     if(button)button.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 && joinOffer?.spaces>0 ? "block":"none";
   }
   let stockSelectMode = null;
-  function changeNetworkMode(official, mode = 4) {
+  function changeNetworkMode(official, mode = 4, variant = "normal") {
     if (partySocket?.readyState === 1 && !partyIsHost) return;
     if (document.getElementById("play-button")?.disabled) return;
     hostedMode = !official;
+    if (hostedMode) hostedVariant = variant === "fast" ? "fast" : "normal";
     hostedMatchActive = false;
+    syncFastGoalDom();
+    refreshSuperScoreboard();
     selectedMode = mode;
     partyRegion = null;
     // The stock lobby sends its current region with mode changes. Select the
     // right region BEFORE calling it; its roster echo remains authoritative.
     const select = document.getElementById("server");
     if (select) {
+      if (hostedMode && serverChoices[preferredHostedRegion]?.variant !== hostedVariant)
+        preferredHostedRegion = hostedVariant === "fast" ? "NCFEU" : "NC4EU";
+      if (hostedMode) for (const [serverCode, choice] of Object.entries(serverChoices)) {
+        if (choice.variant !== hostedVariant || [...select.options].some(option => option.value === serverCode)) continue;
+        const option = document.createElement("option");
+        option.value = serverCode;
+        option.textContent = choice.label;
+        select.appendChild(option);
+      }
       const code = hostedMode ? preferredHostedRegion : preferredOfficialRegion;
       if (![...select.options].some(option => option.value === code)) {
         const option = document.createElement("option");
@@ -77,14 +133,28 @@
   const defaultServerCode = "NC4EU";
   const serverChoices = Object.freeze({
     NC4EU: Object.freeze({
-      label: "Europe",
+      label: "Amsterdam",
       fakeUri: "nc-europe.nitroclash.io:8003",
       url: "wss://nitroclashio.duckdns.org",
+      variant: "normal",
     }),
     NC4OLD: Object.freeze({
-      label: "Europe 2",
+      label: "Frankfurt",
       fakeUri: "nc-old.nitroclash.io:8003",
       url: "wss://fourv4-s2fb.onrender.com",
+      variant: "normal",
+    }),
+    NCFEU: Object.freeze({
+      label: "Amsterdam",
+      fakeUri: "nc-fast-europe.nitroclash.io:8003",
+      url: "wss://nitroclashio.duckdns.org",
+      variant: "fast",
+    }),
+    NCFOLD: Object.freeze({
+      label: "Frankfurt",
+      fakeUri: "nc-fast-old.nitroclash.io:8003",
+      url: "wss://fourv4-s2fb.onrender.com",
+      variant: "fast",
     }),
   });
   const serverListResponse = Object.fromEntries(Object.entries(serverChoices).map(([code, choice]) => [
@@ -133,7 +203,7 @@
       const timeout = setTimeout(() => finish(null), 8000);
       const send = () => { if (!finished && socket.readyState === 1) { sentAt = now(); socket.send(new Uint8Array([99])); } };
       try {
-        socket = new NativeWebSocket(choice.url);
+        socket = new NativeWebSocket(`${choice.url}/?gameMode=${choice.variant}`);
         socket.binaryType = "arraybuffer";
         socket.addEventListener("open", send);
         socket.addEventListener("message", ({ data }) => {
@@ -183,7 +253,7 @@
     closeMatchChat();
     setChatStatus("Sending…");
     clearTimeout(chatConfirmTimer);
-    chatConfirmTimer=setTimeout(()=>{chatPending=false;restoreUnsentChat();setChatStatus("No delivery confirmation. Press T to try again.");},4000);
+    chatConfirmTimer=setTimeout(()=>{chatPending=false;restoreUnsentChat();setChatStatus("No delivery confirmation. Press T or Enter to try again.");},4000);
   }
   function restoreUnsentChat(){const input=document.getElementById("chat-input");if(input && !input.value)input.value=sentChatText;}
   function confirmSpectatorMessage() {
@@ -191,7 +261,7 @@
     chatPending=false; clearTimeout(chatConfirmTimer);
     const input=document.getElementById("chat-input");
     // Never clear a new draft when an earlier message is acknowledged.
-    setChatStatus("Sent · T to chat");
+    setChatStatus("Sent · T or Enter to chat");
   }
   function sendObserverKeys() {
     if(!observerMovement || spectatorChatSocket?.readyState!==1)return;
@@ -251,7 +321,7 @@
           }
         } else if(event.key==="Escape") {
           event.preventDefault();consumedChatKey="Escape";closeMatchChat();
-          setChatStatus("Chat cancelled · T to chat");
+          setChatStatus("Chat cancelled · T or Enter to chat");
         }
         else if(type==="keydown" && event.defaultPrevented && event.key?.length===1 && !event.ctrlKey && !event.metaKey && !event.altKey && !event.isComposing) {
           // A previously registered game/extension handler may cancel typing.
@@ -261,9 +331,10 @@
         }
         return;
       }
-      if(!typing && (event.key?.toLowerCase()==="t" || event.key==="Enter")) {
+      const chatOpenKey=event.key?.toLowerCase()==="t" || event.key==="Enter";
+      if(!typing && chatOpenKey) {
         event.preventDefault();event.stopImmediatePropagation();
-        if(type==="keyup" && event.key?.toLowerCase()==="t" && input) {
+        if(type==="keyup" && input) {
           input.disabled=false;input.readOnly=false;input.style.display="";
           const block=document.getElementById("chat-block");if(block)block.style.display="block";
           input.focus();
@@ -294,7 +365,7 @@
     const transform=function(...args){
       if(controlBodyCapture && controlBodyCapture.index<10) {
         const slot=controlBodyCapture.index++;
-        if(slot>=8)for(let f=this.getFixtureList();f;f=f.getNext())f.setSensor(true);
+        if(slot>=8)for(let f=this.getFixtureList();f;f=f.getNext())f.setSensor(Boolean(controlBodyCapture.observer));
       }
       return original.apply(this,args);
     };
@@ -368,7 +439,7 @@
     const status=document.createElement("div");
     status.id="nc-spectator-chat-status";
     status.style.cssText="display:none;font:11px Arial;color:#a7f3d0;margin-top:3px;pointer-events:none";
-    status.textContent="Press T to chat with players";
+    status.textContent="Press T or Enter to chat with players";
     chat.appendChild(status);
     for(const type of ["mousedown","mouseup","click"])win.addEventListener(type,event=>{
       if(spectatorChatWatching && spectatorChatSocket?.readyState===1 && event.target?.id==="chat-input")event.stopImmediatePropagation();
@@ -377,10 +448,10 @@
 
   function receiveSpectatorChat(bytes) {
     if(bytes[1]===4){confirmSpectatorMessage();return;}
-    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);restoreUnsentChat();setChatStatus("Please wait one second, then press T to retry.");return;}
+    if(bytes[1]===3){chatPending=false;clearTimeout(chatConfirmTimer);restoreUnsentChat();setChatStatus("Please wait one second, then press T or Enter to retry.");return;}
     if (bytes[1] === 0) {
       spectatorChatSupported = true;
-      setChatStatus((observerMovement ? "Move: mouse or WASD/arrows · T: chat" : "Press T to chat with players · Enter to send"));
+      setChatStatus((observerMovement ? "Move: mouse or WASD/arrows · T/Enter: chat" : "Press T or Enter to chat with players"));
       chatRows=[];
       subscribeSpectatorChat();
       return;
@@ -405,13 +476,18 @@
     row.appendChild(label); row.appendChild(body); appendMatchChat(row);
   }
   let pendingGameSocketIntent = null;
+  let pendingGameServer = null;
   let connectionAttemptActive = false;
   let pendingPartyRoute = null;
   let pendingPartyServer = null;
-  const captureGameSocketIntent = () => {
+  const captureGameSocketIntent = requestedCode => {
     pendingGameSocketIntent = inGameSpectateRequested ? "spectate-ingame" : spectateRequested
       ? "spectate-live"
       : reconnectRequested ? "reconnect" : "play";
+    const selectedCode = selectedServerCode();
+    pendingGameServer = serverChoices[requestedCode]?.variant === hostedVariant ? requestedCode
+      : serverChoices[selectedCode]?.variant === hostedVariant ? selectedCode
+      : hostedVariant === "fast" ? "NCFEU" : "NC4EU";
   };
   const readReconnectSession = () => {
     try {
@@ -611,7 +687,7 @@
     send(body = null) {
       if (!this._fake) return this._native.send(body);
       const finish = () => {
-        if (this._fake.kind === "reservation") captureGameSocketIntent();
+        if (this._fake.kind === "reservation") captureGameSocketIntent(this._fake.code);
         this._status = 200;
         this._statusText = "OK";
         this._readyState = 4;
@@ -706,7 +782,7 @@
           // Stock latency updates may propose their fastest original region.
           // Keep the explicitly selected network, including during party creation.
           const requested = textAt(bytes, 2);
-          if (hostedMode && serverChoices[requested]) preferredHostedRegion = requested;
+          if (hostedMode && serverChoices[requested]?.variant === hostedVariant) preferredHostedRegion = requested;
           if (!hostedMode && requested && !serverChoices[requested]) preferredOfficialRegion = requested;
           const region = hostedMode ? preferredHostedRegion : preferredOfficialRegion;
           const packet = new Uint8Array(4 + region.length * 2);
@@ -749,6 +825,7 @@
             if (mode !== 200 && region) {
               selectedMode = mode;
               hostedMode = mode === 4 && !!serverChoices[region];
+              if (hostedMode) hostedVariant = serverChoices[region].variant;
               if (!hostedMode) hostedMatchActive = false;
               partyRegion = region;
               if (hostedMode) preferredHostedRegion = region;
@@ -828,12 +905,13 @@
     const inGameSpectatorSocket = socketIntent === "spectate-ingame";
     const spectatorSocket = socketIntent === "spectate-live" || inGameSpectatorSocket;
     const savedReconnect = reconnectSocket ? readReconnectSession() : null;
-    const requestedServerCode = pendingPartyServer || (isNitroSocket ? serverCodeForSocketUrl(text) : defaultServerCode);
+    const requestedServerCode = pendingPartyServer || pendingGameServer || (isNitroSocket ? serverCodeForSocketUrl(text) : defaultServerCode);
     const gameServerCode = reconnectSocket && serverChoices[savedReconnect?.serverCode]
       ? savedReconnect.serverCode
       : requestedServerCode;
     const gameServerUrl = serverChoices[gameServerCode].url;
     let finalUrl = isNitroSocket ? gameServerUrl : url;
+    if (isNitroSocket) finalUrl += `/?gameMode=${serverChoices[gameServerCode].variant}`;
     const privateRoute = isNitroSocket && !spectatorSocket ? (savedReconnect?.kind === "private" ? savedReconnect : pagePrivateRoute) : null;
     let spectatorFollowPending = false;
     if (spectatorSocket) {
@@ -846,7 +924,7 @@
     }
     if (privateRoute) {
       const teamQuery = privateRoute.team === null ? "" : `&team=${privateRoute.team}`;
-      finalUrl += `/?private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
+      finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}private=1&party=${encodeURIComponent(privateRoute.partyCode)}${teamQuery}`;
       console.log(`[nc-local-4v4] private party ${privateRoute.partyCode}${privateRoute.team === null ? "" : `, team ${privateRoute.team + 1}`}`);
     }
     if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}${inGameSpectatorSocket ? "ingameSpectate" : "spectate"}=1`;
@@ -859,6 +937,15 @@
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
     if (isNitroSocket && socketIntent) {
       hostedMatchActive = true;
+      hostedMatchVariant = serverChoices[gameServerCode].variant;
+      superMatchSeconds = 180;
+      superMatchTurn = 0;
+      superScores = [0, 0];
+      fastGoalOverlayCleared = true;
+      fastGoalBannerUntil = 0;
+      clearTimeout(fastGoalClearTimer);
+      syncFastGoalDom();
+      refreshSuperScoreboard();
       joinOffer=null;
       spectatorChatSocket = socket;
       observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
@@ -904,6 +991,7 @@
             data = packet;
             pendingPartyRoute = null;
             pendingPartyServer = null;
+            pendingGameServer = null;
             playerJoinSent = true;
             saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode);
             clearInterval(reconnectRefreshTimer);
@@ -941,8 +1029,28 @@
             return;
           }
           if(bytes?.[0]===12){setTimeout(()=>socket.close(),0);}
+          if (hostedMatchVariant === "fast" && bytes?.[0] === 6) {
+            fastGoalOverlayCleared = true;
+            fastGoalBannerUntil = 0;
+            syncFastGoalDom();
+            clearTimeout(fastGoalClearTimer);
+            setTimeout(clearFastGoalOverlayNow, 0);
+          }
+          if (hostedMatchVariant === "fast" && (bytes?.[0] === 9 || (bytes?.[0] === 5 && bytes[1] === 3))) {
+            fastGoalOverlayCleared = true;
+            fastGoalBannerUntil = 0;
+            clearTimeout(fastGoalClearTimer);
+            syncFastGoalDom();
+            setTimeout(clearFastGoalOverlayNow, 0);
+          }
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
+            if (bytes[1] === 5 && bytes.length >= 6) {
+              const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+              superScores = [view.getUint16(2), view.getUint16(4)];
+              refreshSuperScoreboard();
+              return;
+            }
             if (inGameSpectatorSocket && bytes[1] === 2 && pendingObserverJoin) {
               observerSupported = true;
               observerMovement=bytes[2]>=1;observerMouseSupported=bytes[2]>=2;
@@ -959,6 +1067,20 @@
             }
             if (spectatorChatSocket === socket) {receiveSpectatorChat(bytes);}
             return;
+          }
+          if (bytes?.[0] === 2 && bytes.length >= 9) {
+            superMatchSeconds = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(5);
+            superMatchTurn = 0;
+            superScores = [0, 0];
+            refreshSuperScoreboard();
+          }
+          if (bytes?.[0] === 5 && bytes.length >= 6) {
+            superMatchTurn = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(2);
+            refreshSuperScoreboard();
+          }
+          if (hostedMatchVariant === "fast" && bytes?.[0] === 14) {
+            superMatchTurn = Math.max(superMatchTurn, superMatchSeconds * 60);
+            refreshSuperScoreboard();
           }
           if (!spectatorSocket && bytes?.[0] === 14) {
             matchEnded = true;
@@ -978,7 +1100,7 @@
             observerSlot=bytes[2];
             chatRows=[];clearTimeout(chatFadeTimer);
             installObserverSensors();
-            const capture={index:0};controlBodyCapture=capture;
+            const capture={index:0,observer:inGameSpectatorSocket};controlBodyCapture=capture;
             setTimeout(()=>{if(controlBodyCapture===capture)controlBodyCapture=null;},0);
           }
           if (spectatorSocket && spectatorFollowPending && bytes?.[0] === 5) {
@@ -1084,7 +1206,7 @@
             stale.destroy?.();
           }
           for(const label of labels.slice(-10).slice(8)) {
-            if(!showInGameSpectators){label.renderable=false;label.__ncHiddenObserver=true;}
+            if(hostedMatchVariant !== "fast" && !showInGameSpectators){label.renderable=false;label.__ncHiddenObserver=true;}
             else if(label.__ncHiddenObserver){label.renderable=true;delete label.__ncHiddenObserver;}
           }
           for (let index = 0; index < children.length; index++) {
@@ -1112,7 +1234,7 @@
                 // An empty slot can become occupied after this client has
                 // already joined. Undo our old hidden state immediately.
                 restoreOccupiedSlot(child, children[index + 1]);
-                if(playerIndex===9 || playerIndex===10) {
+                if(hostedMatchVariant !== "fast" && (playerIndex===9 || playerIndex===10)) {
                   greenObserver(child,children[index+1]);
                   if(!showInGameSpectators){child.renderable=false;child.__ncHiddenObserver=true;}
                   else if(child.__ncHiddenObserver){child.renderable=true;delete child.__ncHiddenObserver;}
@@ -1123,12 +1245,93 @@
           }
         }
       };
+      const hideFastGoalDetails = (stage, active) => {
+        const visit = (node) => {
+          if (!node) return { labels: 0, hidden: false };
+          if (node.__ncFastGoalDetails) {
+            node.visible = !active;
+            node.renderable = !active;
+            if (!active) delete node.__ncFastGoalDetails;
+            else return { labels: 2, hidden: true };
+          }
+          let labels = typeof node.text === "string" && /(GOAL\s*SCORER|SHOT\s*SPEED|ASSIST)\s*:/i.test(node.text) ? 1 : 0;
+          let childHidden = false;
+          for (const child of node.children || []) {
+            const result = visit(child);
+            labels += result.labels;
+            childHidden ||= result.hidden;
+          }
+          if (active && node !== stage && labels >= 2 && !childHidden) {
+            node.visible = false;
+            node.renderable = false;
+            node.__ncFastGoalDetails = true;
+            return { labels, hidden: true };
+          }
+          return { labels, hidden: childHidden };
+        };
+        visit(stage);
+      };
+      const clearFastGoalBannerAtKickoff = (stage, active) => {
+        const visit = (node) => {
+          if (!node) return;
+          if (node.__ncFastGoalBanner) {
+            const hidden = active;
+            node.visible = !hidden;
+            node.renderable = !hidden;
+            if (!hidden) delete node.__ncFastGoalBanner;
+          }
+          if (active && typeof node.text === "string" && /GO+A+L/i.test(node.text)) {
+            node.visible = false;
+            node.renderable = false;
+            node.__ncFastGoalBanner = true;
+          }
+          for (const child of node.children || []) visit(child);
+        };
+        visit(stage);
+      };
+      clearFastGoalOverlayNow = () => {
+        if (!latestGameStage || hostedMatchVariant !== "fast") return;
+        hideFastGoalDetails(latestGameStage, true);
+        clearFastGoalBannerAtKickoff(latestGameStage, true);
+      };
+      const resizeFastBall = (stage, enlarged) => {
+        const ballTexture = win.PIXI?.loader?.resources?.["img/spritesheet4.json"]?.textures?.ballWFG;
+        const queue = [stage];
+        while (queue.length) {
+          const node = queue.shift();
+          if (!node) continue;
+          const square = typeof node.width === "number" && typeof node.height === "number" &&
+            Math.abs(node.width - node.height) < 0.15;
+          const textureIds = node.texture?.textureCacheIds || node.texture?.baseTexture?.textureCacheIds || [];
+          const textureIsBall = node.texture === ballTexture || textureIds.some(id => String(id).includes("ballWFG"));
+          const isBall = node.__ncBallBaseWidth || (node.lastPhysicsPosition && (textureIsBall || (square && node.width >= 1.6 && node.width < 2.8)));
+          if (isBall) {
+            node.__ncBallBaseWidth ||= node.width;
+            node.__ncBallBaseHeight ||= node.height;
+            node.width = node.__ncBallBaseWidth * (enlarged ? FAST_MODE_BALL_SCALE : 1);
+            node.height = node.__ncBallBaseHeight * (enlarged ? FAST_MODE_BALL_SCALE : 1);
+          }
+          for (const child of node.children || []) queue.push(child);
+        }
+      };
       let wrapped = 0;
       for (const prototype of rendererPrototypes) {
         const originalRender = prototype.render;
         if (typeof originalRender !== "function" || originalRender.__nc4v4SpareWrapped) continue;
         const render = function (stage, ...args) {
-          if (hostedMatchActive) hideSpareSlots(stage);observerRenderer=this;
+          latestGameStage = stage;
+          const fastActive = hostedMatchActive && hostedMatchVariant === "fast";
+          if (fastActive && fastGoalBannerUntil && Date.now() >= fastGoalBannerUntil) {
+            fastGoalOverlayCleared = true;
+            fastGoalBannerUntil = 0;
+          }
+          resizeFastBall(stage, fastActive);
+          hideFastGoalDetails(stage, fastActive);
+          clearFastGoalBannerAtKickoff(stage, fastActive);
+          if (hostedMatchActive) {
+            hideSpareSlots(stage);
+          }
+          observerRenderer=this;
           return originalRender.call(this, stage, ...args);
         };
         render.__nc4v4SpareWrapped = true;
@@ -1136,6 +1339,18 @@
         wrapped++;
       }
       if (!wrapped) return false;
+      const scrubFastGoalOverlay = () => {
+        if (!hostedMatchActive || hostedMatchVariant !== "fast") return;
+        if (fastGoalBannerUntil && Date.now() >= fastGoalBannerUntil) {
+          fastGoalOverlayCleared = true;
+          fastGoalBannerUntil = 0;
+        }
+        syncFastGoalDom();
+        clearFastGoalOverlayNow();
+      };
+      setInterval(scrubFastGoalOverlay, 100);
+      document.addEventListener("visibilitychange", scrubFastGoalOverlay);
+      win.addEventListener("focus", scrubFastGoalOverlay);
       win.__nc4v4SpareFilterInstalled = true;
       console.log("[nc-local-4v4] direct spare-player/arrow-pair filter installed");
       return true;
@@ -1161,21 +1376,60 @@
       button.id = "nc-hosted-mode";
       button.type = "button";
       button.textContent = "4 vs 4";
-      button.title = "Hosted 4v4 — Europe / Europe 2";
-      button.addEventListener("click", () => changeNetworkMode(false, 4));
+      button.title = "Normal hosted 4v4 — Amsterdam / Frankfurt";
+      button.addEventListener("click", () => changeNetworkMode(false, 4, "normal"));
       stock.insertAdjacentElement("beforebegin", button);
       button.insertAdjacentText?.("afterend", " ");
     }
+    let fastButton = document.getElementById("nc-fast-mode");
+    if (!fastButton) {
+      fastButton = document.createElement(stock.tagName || "div");
+      fastButton.id = "nc-fast-mode";
+      fastButton.type = "button";
+      fastButton.textContent = "";
+      const superLine = document.createElement("span");
+      superLine.textContent = "SUPER";
+      superLine.style.cssText = "display:block;font-size:.56em;line-height:1;font-weight:900;letter-spacing:.025em;white-space:nowrap;text-shadow:0 2px 3px rgba(45,0,55,.75)";
+      const ncLine = document.createElement("span");
+      ncLine.textContent = "NC";
+      ncLine.style.cssText = "display:block;font-size:.56em;line-height:1;font-weight:900;letter-spacing:.08em;white-space:nowrap;text-shadow:0 2px 3px rgba(45,0,55,.75)";
+      fastButton.appendChild(superLine);
+      fastButton.appendChild(ncLine);
+      fastButton.style.cssText = "display:inline-flex!important;flex-direction:column;align-items:center;justify-content:center;box-sizing:border-box;overflow:hidden;padding:4px 6px!important;color:#fff!important;background-color:#d92f78!important;background-image:linear-gradient(135deg,#ff3b30 0%,#ff8a18 28%,#ff2d95 60%,#7c3aed 100%)!important;border:2px solid rgba(255,220,240,.8)!important;box-shadow:inset 0 1px 7px rgba(255,255,255,.5),0 4px 10px rgba(136,25,111,.45)!important";
+      fastButton.title = "Fast players, faster ball and unlimited boost";
+      fastButton.addEventListener("click", () => changeNetworkMode(false, 4, "fast"));
+      const firstModeButton = stock.parentElement?.querySelector?.('[id^="gamemode-"]');
+      (firstModeButton || stock).insertAdjacentElement("beforebegin", fastButton);
+      fastButton.insertAdjacentText?.("afterend", " ");
+    }
     const base = String(stock.className || "").replace(/\bselected\b/g, "").trim();
-    button.className = base + (hostedMode ? " selected" : "");
-    stock.className = base + (!hostedMode && selectedMode === 4 ? " selected" : "");
+    button.className = base + (hostedMode && hostedVariant === "normal" ? " selected" : "");
+    fastButton.className = base + (hostedMode && hostedVariant === "fast" ? " selected" : "");
+    fastButton.style.setProperty("box-shadow", hostedMode && hostedVariant === "fast" ? "inset 0 1px 8px rgba(255,255,255,.7),0 0 0 3px #fff,0 0 18px #ff4fa3" : "inset 0 1px 7px rgba(255,255,255,.5),0 4px 10px rgba(136,25,111,.45)", "important");
+    // Party roster updates and the stock client's own mode handler can run in
+    // either order. Reconcile every native button so an old official selection
+    // can never remain highlighted beside the authoritative hosted selection.
+    for (const modeButton of document.querySelectorAll('[id^="gamemode-"]')) {
+      const mode = Number(modeButton.id.replace("gamemode-", ""));
+      const modeBase = String(modeButton.className || "").replace(/\bselected\b/g, "").trim();
+      modeButton.className = modeBase + (!hostedMode && mode === selectedMode ? " selected" : "");
+    }
     button.disabled = partySocket?.readyState === 1 && !partyIsHost;
+    fastButton.disabled = button.disabled;
     for(const modeButton of document.querySelectorAll('[id^="gamemode-"]'))modeButton.disabled=button.disabled;
     const select = document.getElementById("server");
     if (!select) return;
     let changed = false;
+    if (hostedMode) for (const [serverCode, choice] of Object.entries(serverChoices)) {
+      if (choice.variant !== hostedVariant || [...select.options].some(option => option.value === serverCode)) continue;
+      const option = document.createElement("option");
+      option.value = serverCode;
+      option.textContent = choice.label;
+      select.appendChild(option);
+      changed = true;
+    }
     for (const option of [...select.options]) {
-      if (!!serverChoices[option.value] !== hostedMode) {
+      if (!!serverChoices[option.value] !== hostedMode || (hostedMode && serverChoices[option.value]?.variant !== hostedVariant)) {
         option.remove();
         changed = true;
       } else if (serverChoices[option.value]) {
@@ -1206,7 +1460,7 @@
     if (!select.__ncModeListener) {
       select.__ncModeListener = true;
       const rememberRegion = () => {
-        if (serverChoices[select.value]) preferredHostedRegion = select.value;
+        if (serverChoices[select.value]?.variant === hostedVariant) preferredHostedRegion = select.value;
         else if (select.value) preferredOfficialRegion = select.value;
       };
       select.addEventListener("change", rememberRegion);
@@ -1249,7 +1503,9 @@
           win.nitroclash.backToHomepage();
           setTimeout(() => {
             preferredHostedRegion = readReconnectSession()?.serverCode || defaultServerCode;
-            changeNetworkMode(false, 4);
+            const savedCode=readReconnectSession()?.serverCode || defaultServerCode;
+            hostedVariant=serverChoices[savedCode]?.variant || "normal";
+            changeNetworkMode(false, 4, hostedVariant);
             win.nitroclash.clickPlay();
           }, 100);
         } catch (error) {
@@ -1270,14 +1526,15 @@
       if(spectatorChatSocket?.readyState===1 && ["kicked-inactivity","connection-lost"].some(id=>{const e=document.getElementById(id);return e && e.style.display==="block";}))spectatorChatSocket.close();
       if(quickJoin && !quickJoinStarted && win.nitroclash && document.getElementById("homepage-loaded")?.style.display==="block") {
         quickJoinStarted=true;
-        gameServerReady.then(()=>{changeNetworkMode(false,4);win.nitroclash.clickPlay();setTimeout(()=>{if(quickJoin)win.nitroclash.clickTutoButton();},300);});
+        gameServerReady.then(()=>{changeNetworkMode(false,4,hostedVariant);win.nitroclash.clickPlay();setTimeout(()=>{if(quickJoin)win.nitroclash.clickTutoButton();},300);});
       }
       if (win.nitroclash && !win.__nc4v4InitialModeApplied &&
           document.getElementById("homepage-loaded")?.style.display === "block") {
         win.__nc4v4InitialModeApplied = true;
-        if (!partySocket) changeNetworkMode(!hostedMode, selectedMode);
+        if (!partySocket) changeNetworkMode(!hostedMode, selectedMode, hostedVariant);
       }
       refreshModeControls();
+      refreshSuperScoreboard();
       if (win.nitroclash && !win.nitroclash.clickPlay?.__nc4v4Wrapped) {
         const originalPlay = win.nitroclash.clickPlay;
         if (typeof originalPlay === "function") {
@@ -1302,7 +1559,7 @@
         button.className=nativeSpectateButton.className;
         button.style.cssText="box-sizing:border-box!important;width:auto!important;min-width:0!important;max-width:90vw!important;height:auto!important;min-height:28px!important;padding:6px 10px!important;margin:6px!important;font:600 13px/1.25 Arial!important;white-space:nowrap!important;vertical-align:middle!important;border:1px solid #c2d0d0!important;border-radius:8px!important;background:#879e9b!important;color:white!important;box-shadow:0 4px 0 #627c78!important;cursor:pointer";
         button.addEventListener("click", () => {
-          if (!hostedMode || partySocket?.readyState === 1) return;
+          if (!hostedMode || hostedVariant === "fast" || partySocket?.readyState === 1) return;
           reconnectRequested = false;
           launchingInGameSpectate = true;
           try { win.nitroclash.clickSpectate(); } finally { launchingInGameSpectate = false; }
@@ -1311,7 +1568,7 @@
       }
       const inGameButton = document.getElementById("nc-ingame-spectate");
       if (inGameButton) {
-        inGameButton.style.display = hostedMode ? "inline-block" : "none";
+        inGameButton.style.display = hostedMode && hostedVariant !== "fast" ? "inline-block" : "none";
         inGameButton.disabled = partySocket?.readyState === 1 || !!document.getElementById("play-button")?.disabled;
       }
       installReconnectButton(document.getElementById("connection-lost"), "lost");
@@ -1340,19 +1597,73 @@
         }
       }
       const badge = document.getElementById("nc-local-4v4-badge");
+      const announcement = document.getElementById("nc-11v11-announcement");
       const homepage = document.getElementById("homepage");
-      if (badge && homepage) {
+      if (homepage) {
         const homepageVisible = homepage.style.display !== "none" &&
           (!win.getComputedStyle || win.getComputedStyle(homepage).display !== "none");
-        badge.style.display = homepageVisible ? "block" : "none";
+        if (badge) badge.style.display = homepageVisible ? "block" : "none";
+        if (announcement) {
+          announcement.style.display = homepageVisible ? "block" : "none";
+          const partyBar = document.getElementById("team-bar");
+          const partyStyle = partyBar && win.getComputedStyle ? win.getComputedStyle(partyBar) : null;
+          const partyLobbyVisible = !!partyBar && (!partyStyle || (partyStyle.display !== "none" && partyStyle.visibility !== "hidden"));
+          announcement.style.zIndex = partyLobbyVisible ? "0" : "999998";
+        }
       }
     };
     relabel();
     if (!win.__nc4v4RelabelTimer) win.__nc4v4RelabelTimer = setInterval(relabel, 500);
+    if (!document.getElementById("nc-11v11-announcement")) {
+      const style = document.createElement("style");
+      style.textContent = `
+        @keyframes nc11v11Glow { 0%,100% { filter:drop-shadow(0 0 3px rgba(255,68,170,.45)); } 50% { filter:drop-shadow(0 0 10px rgba(255,139,32,.75)); } }
+        @media (max-width:1050px) { #nc-11v11-announcement { top:auto!important;bottom:12px!important;transform:none!important;width:190px!important; } }
+        @media (max-width:620px) { #nc-11v11-announcement { left:50%!important;bottom:8px!important;transform:translateX(-50%)!important;width:calc(100vw - 24px)!important;max-width:300px!important; } }
+      `;
+      document.head?.appendChild(style);
+      const announcement = document.createElement("aside");
+      announcement.id = "nc-11v11-announcement";
+      announcement.setAttribute("aria-label", "11 versus 11 release announcement");
+      announcement.style.cssText = "position:fixed;left:18px;top:50%;transform:translateY(-50%);z-index:999998;width:230px;box-sizing:border-box;padding:17px 16px 14px;text-align:center;color:#fff;background:linear-gradient(145deg,rgba(93,28,135,.96),rgba(226,42,111,.96) 48%,rgba(255,126,27,.97));border:2px solid rgba(255,224,244,.9);border-radius:16px;box-shadow:inset 0 1px 12px rgba(255,255,255,.35),0 10px 30px rgba(45,8,65,.55);font-family:Arial,sans-serif;pointer-events:none;user-select:none;animation:nc11v11Glow 3s ease-in-out infinite";
+      const title = document.createElement("div");
+      title.textContent = "11 VS 11";
+      title.style.cssText = "font-size:29px;line-height:1;font-weight:900;letter-spacing:.04em;text-shadow:0 3px 5px rgba(44,0,55,.65)";
+      const date = document.createElement("div");
+      date.textContent = "RELEASES 26/09/2026";
+      date.style.cssText = "margin-top:7px;font-size:15px;line-height:1.15;font-weight:800;letter-spacing:.025em;text-shadow:0 2px 3px rgba(44,0,55,.6)";
+      const note = document.createElement("div");
+      note.textContent = "after the 2v2 final";
+      note.style.cssText = "margin-top:8px;padding-top:7px;border-top:1px solid rgba(255,255,255,.35);font-size:10px;line-height:1.2;font-weight:600;letter-spacing:.06em;text-transform:lowercase;opacity:.88";
+      announcement.appendChild(title);
+      announcement.appendChild(date);
+      announcement.appendChild(note);
+      document.body.appendChild(announcement);
+    }
+    if (!document.getElementById("nc-super-scoreboard")) {
+      const scoreboard = document.createElement("div");
+      scoreboard.id = "nc-super-scoreboard";
+      scoreboard.setAttribute("aria-label", "SUPER NC scoreboard");
+      scoreboard.style.cssText = "display:none;position:fixed;top:4px;left:50%;transform:translateX(-50%);z-index:999997;align-items:stretch;overflow:hidden;min-width:230px;height:36px;border:1px solid rgba(255,255,255,.82);border-radius:9px;background:#171329;box-shadow:0 4px 14px rgba(7,5,25,.58),inset 0 1px 0 rgba(255,255,255,.3);font-family:Arial,sans-serif;color:#fff;pointer-events:none;user-select:none";
+      const panel = (colors, scoreAttribute) => {
+        const side = document.createElement("div");
+        side.style.cssText = `width:65px;display:flex;align-items:center;justify-content:center;padding:0 8px;background:linear-gradient(135deg,${colors[0]},${colors[1]});text-shadow:0 2px 4px rgba(0,0,0,.55)`;
+        side.innerHTML = `<strong ${scoreAttribute} style="font-size:24px;line-height:1;font-weight:900">0</strong>`;
+        return side;
+      };
+      const centre = document.createElement("div");
+      centre.style.cssText = "min-width:80px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 6px;background:linear-gradient(180deg,#312353,#171329);box-shadow:inset 8px 0 14px -12px #55d8ff,inset -8px 0 14px -12px #ff5b82";
+      centre.innerHTML = '<span style="font-size:6px;font-weight:900;letter-spacing:.14em;color:#f0c7ff">SUPER NC</span><strong data-nc-clock style="margin-top:1px;font-size:15px;line-height:1;font-weight:900">3:00</strong>';
+      scoreboard.appendChild(panel(["#087dcc", "#35c7ef"], "data-nc-blue"));
+      scoreboard.appendChild(centre);
+      scoreboard.appendChild(panel(["#ff3864", "#b80f52"], "data-nc-red"));
+      document.body.appendChild(scoreboard);
+      refreshSuperScoreboard();
+    }
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.17.1";
+    badge.textContent = "HOSTED 4v4 v3.24.5";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
