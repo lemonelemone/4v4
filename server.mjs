@@ -22,6 +22,7 @@ const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
 const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
 const DEFAULT_IDLE_TIMEOUT_MS = 20_000;
+const ADDON_PROTOCOL_VERSION = 29;
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
 const ALL_PLAYER_SLOTS = Object.freeze(Array.from({ length: CLIENT_SLOTS }, (_, slot) => slot));
 const PLAYER_RADIUS = 0.6103515625;
@@ -642,6 +643,15 @@ function goalSpeedsPacket(arena) {
   return packet;
 }
 
+function occupiedSlotsPacket(arena) {
+  let mask = 0;
+  for (const slot of arena.connections.keys()) mask |= 1 << slot;
+  for (const watcher of arena.spectators) {
+    if (watcher.inGameSpectator && Number.isInteger(watcher.slot)) mask |= 1 << watcher.slot;
+  }
+  return Buffer.from([26, 19, mask & 255, (mask >>> 8) & 255]);
+}
+
 // A complete six-second, 60 Hz clip is sent once. Playback is then entirely
 // local to each browser, so selecting, pausing or skipping never affects anyone.
 function postgameGoalClipPacket(clip, index, total) {
@@ -1016,6 +1026,15 @@ function arenaSend(arena, payload, opcode = 2) {
   for (const spectator of arena.spectators) {
     if (spectator.ready && !spectator.cleaned) spectator.send(spectatorPayload, opcode);
   }
+  // Keep camera-safe parked bodies hidden. Without this mask, ordinary
+  // spectators see the empty slots follow the ball as a row of player sprites.
+  if (payload?.[0] === 10) {
+    const occupied = occupiedSlotsPacket(arena);
+    for (const connection of arena.connections.values())
+      if (connection.ready && !connection.cleaned) connection.send(occupied);
+    for (const spectator of arena.spectators)
+      if (spectator.ready && !spectator.cleaned) spectator.send(occupied);
+  }
 }
 
 function getSpectatorArena(gameMode = "normal") {
@@ -1311,7 +1330,9 @@ function runArenaTick(arena) {
             // Save the same kickoff-bounded native state frames so each goal can
             // be shown again, fullscreen, after the match has finished.
             arena.goalClips.push({
-              frames: arena.history.slice(-FAST_POSTGAME_PLAYBACK_TICKS),
+              // Keep ten seconds for downloadable NCR clips. The corner
+              // player's simple view still trims this to six seconds.
+              frames: arena.history.slice(-FAST_POSTGAME_GOAL_TICKS),
               goal: {
                 scorer: goal.scorer,
                 assist: goal.assist,
@@ -1615,7 +1636,8 @@ function assignPrivateConnection(connection) {
 }
 
 function sendArenaEntry(connection, arena) {
-  connection.send(Buffer.from([26, 0])); // Addon spectator-chat capability.
+  connection.send(Buffer.from([26, 0, ADDON_PROTOCOL_VERSION])); // Addon capability/version.
+  connection.send(occupiedSlotsPacket(arena));
   connection.send(controlPacket(arena.world, connection.slot, connection.username));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
@@ -1631,7 +1653,8 @@ function sendArenaEntry(connection, arena) {
 }
 
 function sendSpectatorEntry(connection, arena) {
-  connection.send(Buffer.from([26, 0]));
+  connection.send(Buffer.from([26, 0, ADDON_PROTOCOL_VERSION]));
+  connection.send(occupiedSlotsPacket(arena));
   const focusSlot = connection.inGameSpectator ? connection.slot : [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
   connection.send(controlPacket(arena.world, focusSlot, null, true));
   connection.send(Buffer.from([11, 8, 0]));

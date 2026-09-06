@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.28.0
+// @version      3.29.0
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -49,6 +49,16 @@
   let goalPlayerStartedAt = 0;
   let goalPlayerFrame = 0;
   let goalPlayerAnimation = 0;
+  let goalNcrCache = new Map();
+  let goalNcrRequested = new Set();
+  let occupiedSlotMask = 0;
+  let nativeReplayRecorder = null;
+  let nativeReplayChunks = [];
+  let nativeReplayUrl = "";
+  let nativeReplayStartedAt = 0;
+  let nativeReplayKickoffAt = 0;
+  let nativeReplayRanges = [];
+  let nativeReplayStopAt = 0;
   let matchGoalSpeeds = [];
   let superMatchEnded = false;
   let superEndStatsVisible = true;
@@ -90,12 +100,75 @@
     player.querySelector("[data-nc-slideshow]").textContent = goalPlayerSlideshow ? "Stop" : "Play all";
     player.querySelector("[data-nc-goal-prev]").disabled = goalReelTotal < 2;
     player.querySelector("[data-nc-goal-next]").disabled = goalReelTotal < 2;
+    const goalReady = goalNcrCache.has(goalReelCurrent);
+    const allReady = goalNcrCache.has(255);
+    const goalDownload = player.querySelector("[data-nc-download-goal]");
+    const allDownload = player.querySelector("[data-nc-download-all]");
+    goalDownload.disabled = !goalReady;
+    allDownload.disabled = !allReady;
+    goalDownload.textContent = goalReady ? "Goal NCR" : "Preparing…";
+    allDownload.textContent = allReady ? "All NCR" : "Preparing…";
     setGoalReelVisible(superMatchEnded);
+  }
+  function releaseNativeReplay() {
+    if (nativeReplayRecorder?.state === "recording") nativeReplayRecorder.stop();
+    nativeReplayRecorder = null; nativeReplayChunks = []; nativeReplayRanges = [];
+    nativeReplayStartedAt = 0; nativeReplayKickoffAt = 0; nativeReplayStopAt = 0;
+    if (nativeReplayUrl) URL.revokeObjectURL(nativeReplayUrl);
+    nativeReplayUrl = "";
+    const video = document.getElementById("nc-goal-reel-video");
+    if (video) { video.pause(); video.removeAttribute("src"); video.load(); }
+  }
+  function largestGameCanvas() {
+    return [...document.querySelectorAll("canvas")]
+      .filter(canvas => canvas.width >= 300 && canvas.height >= 150)
+      .sort((a, b) => b.width * b.height - a.width * a.height)[0] || null;
+  }
+  function startNativeReplayCapture() {
+    releaseNativeReplay();
+    setTimeout(() => {
+      if (!hostedMatchActive || superMatchEnded || nativeReplayRecorder) return;
+      const canvas = largestGameCanvas();
+      if (!canvas?.captureStream || !win.MediaRecorder) return;
+      try {
+        const mimeType = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"]
+          .find(type => win.MediaRecorder.isTypeSupported?.(type)) || "";
+        nativeReplayChunks = [];
+        const recorder = new win.MediaRecorder(canvas.captureStream(60), mimeType ? { mimeType, videoBitsPerSecond: 5_000_000 } : undefined);
+        nativeReplayRecorder = recorder; nativeReplayStartedAt = performance.now(); nativeReplayKickoffAt = 0;
+        recorder.addEventListener("dataavailable", event => { if (event.data?.size) nativeReplayChunks.push(event.data); });
+        recorder.addEventListener("stop", () => {
+          if (nativeReplayRecorder !== recorder) return;
+          if (!nativeReplayChunks.length) return;
+          const blob = new Blob(nativeReplayChunks, { type: recorder.mimeType || "video/webm" });
+          if (nativeReplayUrl) URL.revokeObjectURL(nativeReplayUrl);
+          nativeReplayUrl = URL.createObjectURL(blob);
+          const video = document.getElementById("nc-goal-reel-video");
+          if (video) { video.src = nativeReplayUrl; video.load(); }
+          if (superMatchEnded && goalReelTotal && !goalPlayerClosed) playGoal(goalReelCurrent, false);
+        });
+        recorder.start(1000);
+      } catch (error) { console.warn("[nc-local-4v4] native goal capture unavailable", error); }
+    }, 250);
+  }
+  function markNativeKickoff() {
+    if (nativeReplayStartedAt) nativeReplayKickoffAt = Math.max(0, (performance.now() - nativeReplayStartedAt) / 1000);
+  }
+  function markNativeGoal() {
+    if (!nativeReplayStartedAt) return;
+    const end = Math.max(0, (performance.now() - nativeReplayStartedAt) / 1000);
+    nativeReplayRanges.push({ start: Math.max(nativeReplayKickoffAt, end - 6), end: end + .35 });
+  }
+  function stopNativeReplayCapture() {
+    nativeReplayStopAt = performance.now();
+    if (nativeReplayRecorder?.state === "recording") nativeReplayRecorder.stop();
   }
   function resetGoalPlayer() {
     cancelAnimationFrame(goalPlayerAnimation);
     goalPlayerAnimation = 0; goalPlayerSlideshow = false; goalPlayerClosed = false;
     goalPlayerClips = []; goalReelDetails = []; goalReelCurrent = 0; goalReelTotal = 0;
+    goalNcrCache = new Map(); goalNcrRequested = new Set();
+    releaseNativeReplay();
     setGoalReelVisible(false);
   }
   function drawGoalPlayerFrame(frame) {
@@ -136,6 +209,33 @@
     goalPlayerSlideshow = slideshow;
     goalPlayerStartedAt = performance.now(); goalPlayerFrame = 0;
     cancelAnimationFrame(goalPlayerAnimation);
+    const canvas = document.getElementById("nc-goal-reel-canvas");
+    const video = document.getElementById("nc-goal-reel-video");
+    const nativeRange = nativeReplayRanges[goalReelCurrent];
+    const useNative = goalPlayerMode === "replay" && nativeReplayUrl && nativeRange && video;
+    if (canvas) canvas.style.display = useNative ? "none" : "block";
+    if (video) video.style.display = useNative ? "block" : "none";
+    if (useNative) {
+      const finishNative = () => {
+        if (!goalPlayerSlideshow || goalReelCurrent + 1 >= goalReelTotal) {
+          goalPlayerSlideshow = false; refreshSuperReplaySummary(); return;
+        }
+        playGoal(goalReelCurrent + 1, true);
+      };
+      const begin = () => {
+        video.currentTime = Math.min(nativeRange.start, Math.max(0, (video.duration || nativeRange.end) - .05));
+        video.play().catch(() => {});
+        const watch = () => {
+          if (goalPlayerClosed || !superMatchEnded) return video.pause();
+          if (video.currentTime >= nativeRange.end || video.ended) { video.pause(); finishNative(); return; }
+          goalPlayerAnimation = requestAnimationFrame(watch);
+        };
+        goalPlayerAnimation = requestAnimationFrame(watch);
+      };
+      if (video.readyState >= 1) begin(); else video.addEventListener("loadedmetadata", begin, { once: true });
+      refreshSuperReplaySummary();
+      return;
+    }
     const animate = now => {
       const clip = goalPlayerClips[goalReelCurrent];
       if (!clip?.length || goalPlayerClosed || !superMatchEnded) return;
@@ -149,7 +249,17 @@
     goalPlayerAnimation = requestAnimationFrame(animate);
   }
   function downloadGoalNcr(index) {
-    if (spectatorChatSocket?.readyState === 1) spectatorChatSocket.send(new Uint8Array([26, 10, index]));
+    const bytes = goalNcrCache.get(index);
+    if (!bytes) {
+      if (spectatorChatSocket?.readyState === 1 && !goalNcrRequested.has(index)) {
+        goalNcrRequested.add(index); spectatorChatSocket.send(new Uint8Array([26, 10, index]));
+      }
+      refreshSuperReplaySummary(); return;
+    }
+    const blob = new Blob([bytes], { type: "application/octet-stream" });
+    const link = document.createElement("a"), url = URL.createObjectURL(blob);
+    link.href = url; link.download = index === 255 ? "nitroclash-all-goals.ncr" : `nitroclash-goal-${index + 1}.ncr`;
+    document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   function setGoalSpeedsVisible(visible) {
     const panel = document.getElementById("nc-goal-speeds");
@@ -159,6 +269,10 @@
     if (list) list.innerHTML = matchGoalSpeeds.length
       ? matchGoalSpeeds.map((speed, index) => `<div>Goal ${index + 1} speed: <strong>${speed} km/h</strong></div>`).join("")
       : "<div>No goals yet</div>";
+  }
+  function setServerVersionWarning(outdated) {
+    const warning = document.getElementById("nc-server-version-warning");
+    if (warning) warning.style.display = outdated ? "block" : "none";
   }
   function receiveGoalReel(bytes) {
     if (bytes[1] === 6) {
@@ -174,7 +288,13 @@
         };
         const scorer = readText(8);
         const assist = readText(scorer.offset);
-        goalReelDetails[index] = `${scorer.value || "Uncredited"} • Assist: ${assist.value || "None"} • ${Math.round(view.getFloat32(4) * 3.6)} km/h`;
+        goalReelDetails[index] = `${scorer.value || "Uncredited"} • Assist: ${assist.value || "None"} • ${Math.ceil(view.getFloat32(4) * 5)} km/h`;
+      }
+      if (!goalNcrRequested.has(index) && spectatorChatSocket?.readyState === 1) {
+        goalNcrRequested.add(index); spectatorChatSocket.send(new Uint8Array([26, 10, index]));
+      }
+      if (index + 1 === goalReelTotal && !goalNcrRequested.has(255) && spectatorChatSocket?.readyState === 1) {
+        goalNcrRequested.add(255); spectatorChatSocket.send(new Uint8Array([26, 10, 255]));
       }
       refreshSuperReplaySummary();
     } else if (bytes[1] === 17 && bytes.length >= 6) {
@@ -192,13 +312,13 @@
       if (index === 0 && !goalPlayerClosed) playGoal(0, false);
       else refreshSuperReplaySummary();
     } else if (bytes[1] === 11 && bytes.length > 3) {
-      const requested = bytes[2], blob = new Blob([bytes.slice(3)], { type: "application/octet-stream" });
-      const link = document.createElement("a"), url = URL.createObjectURL(blob);
-      link.href = url; link.download = requested === 255 ? "nitroclash-all-goals.ncr" : `nitroclash-goal-${requested + 1}.ncr`;
-      document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      goalNcrCache.set(bytes[2], bytes.slice(3));
+      refreshSuperReplaySummary();
     } else if (bytes[1] === 18 && bytes.length >= 3) {
       const count = bytes[2], view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-      if (bytes.length >= 3 + count * 4) matchGoalSpeeds = Array.from({ length: count }, (_, index) => Math.round(view.getFloat32(3 + index * 4) * 3.6));
+      if (bytes.length >= 3 + count * 4) matchGoalSpeeds = Array.from({ length: count }, (_, index) => Math.ceil(view.getFloat32(3 + index * 4) * 5));
+    } else if (bytes[1] === 19 && bytes.length >= 4) {
+      occupiedSlotMask = bytes[2] | (bytes[3] << 8);
     }
   }
   function syncFastGoalDom() {
@@ -1233,9 +1353,22 @@
             event.stopImmediatePropagation?.();
             return;
           }
+          if (bytes?.[0] === 6 && bytes.length >= 12) {
+            markNativeGoal();
+            const speed = Math.ceil(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(8) * 5);
+            if (Number.isFinite(speed)) {
+              matchGoalSpeeds.push(speed);
+              setGoalSpeedsVisible(document.getElementById("nc-goal-speeds")?.style.display === "block");
+            }
+          }
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
-            if ([6, 11, 17, 18].includes(bytes[1])) {
+            if (bytes[1] === 0) {
+              setServerVersionWarning(bytes[2] !== 29);
+              receiveSpectatorChat(bytes);
+              return;
+            }
+            if ([6, 11, 17, 18, 19].includes(bytes[1])) {
               receiveGoalReel(bytes);
               return;
             }
@@ -1272,13 +1405,26 @@
             superMatchTurn = 0;
             superScores = [0, 0];
             refreshSuperScoreboard();
+            startNativeReplayCapture();
+          }
+          if (bytes?.[0] === 9) {
+            if (superMatchEnded) {
+              superMatchEnded = false; matchGoalSpeeds = []; resetGoalPlayer(); startNativeReplayCapture();
+            } else {
+              if (!nativeReplayRecorder && !nativeReplayStartedAt) startNativeReplayCapture();
+              markNativeKickoff();
+            }
           }
           if (bytes?.[0] === 5 && bytes.length >= 6) {
+            if (bytes[1] === 3 && superMatchEnded) {
+              superMatchEnded = false; matchGoalSpeeds = []; resetGoalPlayer(); startNativeReplayCapture();
+            }
             superMatchTurn = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(2);
             refreshSuperScoreboard();
           }
           if (hostedMatchActive && bytes?.[0] === 14) {
             superMatchEnded = true;
+            stopNativeReplayCapture();
             setGoalSpeedsVisible(false);
             setSuperEndStatsVisible(true);
             refreshSuperEndStatsControl();
@@ -1426,7 +1572,8 @@
               if(observerMovement && playerIndex===observerSlot)observerSprite=child;
               playerIndex++;
               const outsideArena = position.x < -20 || position.x > 120 || position.y < -20 || position.y > 80;
-              if (outsideArena) {
+              const occupied = Boolean(occupiedSlotMask & (1 << (playerIndex - 1)));
+              if (outsideArena || !occupied) {
                 hideForThisFrame(child);
               // The closed client constructs the scene in exact pairs:
               // player[slot], marker[slot], player[slot + 1], marker[slot + 1].
@@ -1876,12 +2023,13 @@
           <span data-nc-goal-detail style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;opacity:.9">Loading replay…</span>
           <button data-nc-goal-close type="button" title="Close replay player" style="width:22px;height:22px;padding:0;border:0;border-radius:50%;background:#dc3f59;color:#fff;font:bold 14px Arial;cursor:pointer">×</button>
         </div>
-        <canvas id="nc-goal-reel-canvas" width="640" height="360" aria-label="Personal goal replay" style="display:block;width:100%;height:calc(100% - 91px);background:#355f29;cursor:move"></canvas>
+        <video id="nc-goal-reel-video" muted playsinline aria-label="Personal native goal replay" style="display:none;width:100%;height:calc(100% - 91px);object-fit:cover;background:#000;cursor:move"></video>
+        <canvas id="nc-goal-reel-canvas" width="640" height="360" aria-label="Personal simple goal replay" style="display:block;width:100%;height:calc(100% - 91px);background:#355f29;cursor:move"></canvas>
         <div style="height:60px;box-sizing:border-box;display:flex;align-content:center;justify-content:center;gap:4px;flex-wrap:wrap;padding:5px;background:rgba(12,14,20,.98)">
           <button data-nc-goal-prev type="button" title="Previous goal">◀</button><button data-nc-slideshow type="button">Play all</button><button data-nc-goal-next type="button" title="Next goal">▶</button>
           <button data-nc-view-mode type="button">Simple replay</button><button data-nc-download-goal type="button">Goal NCR</button><button data-nc-download-all type="button">All NCR</button>
         </div>
-        <div data-nc-goal-resize title="Drag to resize" style="position:absolute;right:0;bottom:0;width:17px;height:17px;cursor:nwse-resize;background:linear-gradient(135deg,transparent 45%,rgba(255,255,255,.9) 48%,rgba(255,255,255,.9) 56%,transparent 59%,transparent 68%,rgba(255,255,255,.9) 71%,rgba(255,255,255,.9) 79%,transparent 82%)"></div>`;
+        <div data-nc-goal-resize title="Drag to resize" style="position:absolute;left:0;top:0;z-index:2;width:17px;height:17px;cursor:nwse-resize;background:linear-gradient(135deg,rgba(255,255,255,.9) 18%,transparent 21%,transparent 32%,rgba(255,255,255,.9) 35%,rgba(255,255,255,.9) 43%,transparent 46%)"></div>`;
       for (const button of reel.querySelectorAll("button:not([data-nc-goal-close])"))
         button.style.cssText = "padding:4px 7px;border:1px solid rgba(255,255,255,.5);border-radius:5px;background:#f5f5f5;color:#252033;font:700 10px Arial;cursor:pointer";
       document.body.appendChild(reel);
@@ -1896,7 +2044,7 @@
       });
       reel.querySelector("[data-nc-view-mode]").addEventListener("click", () => {
         goalPlayerMode = goalPlayerMode === "replay" ? "simple" : "replay";
-        drawGoalPlayerFrame(goalPlayerClips[goalReelCurrent]?.[goalPlayerFrame]); refreshSuperReplaySummary();
+        playGoal(goalReelCurrent, goalPlayerSlideshow); refreshSuperReplaySummary();
       });
       reel.querySelector("[data-nc-download-goal]").addEventListener("click", () => downloadGoalNcr(goalReelCurrent));
       reel.querySelector("[data-nc-download-all]").addEventListener("click", () => downloadGoalNcr(255));
@@ -1909,11 +2057,12 @@
       };
       reel.querySelector("[data-nc-goal-drag]").addEventListener("pointerdown", event => { if (!event.target.closest("button")) startMove(event); });
       reel.querySelector("canvas").addEventListener("pointerdown", startMove);
+      reel.querySelector("video").addEventListener("pointerdown", startMove);
       reel.querySelector("[data-nc-goal-resize]").addEventListener("pointerdown", event => {
         if (event.button !== 0) return;
         const box = reel.getBoundingClientRect();
         reel.style.left = `${box.left}px`; reel.style.top = `${box.top}px`; reel.style.right = "auto"; reel.style.bottom = "auto";
-        drag = { type: "resize", x: event.clientX, y: event.clientY, width: box.width, height: box.height };
+        drag = { type: "resize", x: event.clientX, y: event.clientY, width: box.width, height: box.height, left: box.left, top: box.top, right: box.right, bottom: box.bottom };
         event.preventDefault(); event.stopPropagation();
       });
       win.addEventListener("pointermove", event => {
@@ -1922,11 +2071,11 @@
           reel.style.left = `${Math.max(0, Math.min(innerWidth - reel.offsetWidth, drag.left + event.clientX - drag.x))}px`;
           reel.style.top = `${Math.max(0, Math.min(innerHeight - reel.offsetHeight, drag.top + event.clientY - drag.y))}px`;
         } else {
-          const width = Math.max(280, Math.min(innerWidth - 16, drag.width + event.clientX - drag.x));
-          const height = Math.max(220, Math.min(innerHeight - 16, drag.height + event.clientY - drag.y));
+          const width = Math.max(280, Math.min(innerWidth - 16, drag.width - (event.clientX - drag.x)));
+          const height = Math.max(220, Math.min(innerHeight - 16, drag.height - (event.clientY - drag.y)));
           reel.style.width = `${width}px`; reel.style.height = `${height}px`;
-          reel.style.left = `${Math.max(0, Math.min(reel.offsetLeft, innerWidth - width))}px`;
-          reel.style.top = `${Math.max(0, Math.min(reel.offsetTop, innerHeight - height))}px`;
+          reel.style.left = `${Math.max(0, drag.right - width)}px`;
+          reel.style.top = `${Math.max(0, drag.bottom - height)}px`;
           drawGoalPlayerFrame(goalPlayerClips[goalReelCurrent]?.[goalPlayerFrame]);
         }
       }, true);
@@ -1940,10 +2089,17 @@
       panel.innerHTML = '<strong style="display:block;margin-bottom:3px;font-size:11px;letter-spacing:.08em">GOAL SPEEDS</strong><div data-nc-goal-speeds-list>No goals yet</div>';
       document.body.appendChild(panel);
     }
+    if (!document.getElementById("nc-server-version-warning")) {
+      const warning = document.createElement("div");
+      warning.id = "nc-server-version-warning";
+      warning.textContent = "Server is older than v3.29.0 — restart it from the new local folder to enable corrected replays, speeds and spectator rendering.";
+      warning.style.cssText = "display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:1000001;max-width:min(620px,calc(100vw - 24px));box-sizing:border-box;padding:8px 12px;border:2px solid #ffd0d8;border-radius:8px;background:#b91c3c;color:#fff;font:bold 12px Arial;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.45)";
+      document.body.appendChild(warning);
+    }
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.28.0";
+    badge.textContent = "HOSTED 4v4 v3.29.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
