@@ -11,10 +11,17 @@ const TICK_MS = 1000 / PHYSICS_HZ;
 const SNAPSHOT_EVERY_TICKS = PHYSICS_HZ / SNAPSHOT_HZ;
 const CELEBRATION_TICKS = PHYSICS_HZ * 3;
 const REPLAY_TICKS = PHYSICS_HZ * 5;
+const FAST_POSTGAME_GOAL_SECONDS = 10;
+const FAST_POSTGAME_GOAL_TICKS = PHYSICS_HZ * FAST_POSTGAME_GOAL_SECONDS;
+const FAST_POSTGAME_PLAYBACK_SECONDS = 6;
+const FAST_POSTGAME_PLAYBACK_TICKS = PHYSICS_HZ * FAST_POSTGAME_PLAYBACK_SECONDS;
+const NORMAL_POSTGAME_MS = 60_000;
+const FAST_POSTGAME_MS = 50_000;
 const REPLAY_HOLD_TICKS = PHYSICS_HZ * 2;
 const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
 const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
+const DEFAULT_IDLE_TIMEOUT_MS = 20_000;
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
 const ALL_PLAYER_SLOTS = Object.freeze(Array.from({ length: CLIENT_SLOTS }, (_, slot) => slot));
 const PLAYER_RADIUS = 0.6103515625;
@@ -289,7 +296,12 @@ function mapPacket(world = null) {
   return buffer;
 }
 
-function controlPacket(world, controlledSlot, username) {
+function cameraSafePlayerState(state, fallback, enabled) {
+  if (!enabled || (state.x >= -20 && state.x <= 120 && state.y >= -20 && state.y <= 80)) return state;
+  return { x: fallback.x, y: fallback.y, angle: 0, vx: 0, vy: 0, angularVelocity: 0 };
+}
+
+function controlPacket(world, controlledSlot, username, safeCameraTargets = false) {
   // A player entry supplies its username. Spectator control packets pass null
   // so choosing a camera target never overwrites that real player's name.
   if (username !== null) world.players[controlledSlot].name = username || "Player";
@@ -305,15 +317,15 @@ function controlPacket(world, controlledSlot, username) {
   buffer.writeInt16BE(world.scores[0], 11);
   buffer.writeInt16BE(world.scores[1], 13);
   let offset = 15;
+  const ball = bodyState(world.ball);
   for (const player of world.players) {
-    const state = bodyState(player);
+    const state = cameraSafePlayerState(bodyState(player), ball, safeCameraTargets);
     for (const value of [state.x, state.y, state.angle, state.vx, state.vy, state.angularVelocity, player.aim]) {
       buffer.writeFloatBE(value, offset);
       offset += 4;
     }
     buffer[offset++] = player.flags;
   }
-  const ball = bodyState(world.ball);
   for (const value of [ball.x, ball.y, ball.angle, ball.vx, ball.vy, ball.angularVelocity]) {
     buffer.writeFloatBE(value, offset);
     offset += 4;
@@ -323,46 +335,64 @@ function controlPacket(world, controlledSlot, username) {
   return buffer;
 }
 
-function startPacket(world, countdownMs = 4000) {
+function startPacket(world, countdownMs = 4000, safeCameraTargets = false) {
   const buffer = Buffer.alloc(9 + CLIENT_SLOTS * 12 + 12);
   buffer[0] = 9;
   buffer.writeInt32BE(world.turn, 1);
   buffer.writeInt32BE(countdownMs, 5);
   let offset = 9;
+  const ball = bodyState(world.ball);
   for (const player of world.players) {
-    const state = bodyState(player);
+    const state = cameraSafePlayerState(bodyState(player), ball, safeCameraTargets);
     buffer.writeFloatBE(state.x, offset);
     buffer.writeFloatBE(state.y, offset + 4);
     buffer.writeFloatBE(state.angle, offset + 8);
     offset += 12;
   }
-  const ball = bodyState(world.ball);
   buffer.writeFloatBE(ball.x, offset);
   buffer.writeFloatBE(ball.y, offset + 4);
   buffer.writeFloatBE(ball.angle, offset + 8);
   return buffer;
 }
 
-function statePacket(world) {
+function statePacket(world, safeCameraTargets = false) {
   const buffer = Buffer.alloc(6 + CLIENT_SLOTS * 33 + 24);
   buffer[0] = 5;
   buffer[1] = world.state;
   buffer.writeInt32BE(world.turn, 2);
   let offset = 6;
+  const ball = bodyState(world.ball);
   for (const player of world.players) {
-    const state = bodyState(player);
+    const state = cameraSafePlayerState(bodyState(player), ball, safeCameraTargets);
     for (const value of [state.x, state.y, state.angle, state.vx, state.vy, state.angularVelocity, player.energy, player.aim]) {
       buffer.writeFloatBE(value, offset);
       offset += 4;
     }
     buffer[offset++] = player.flags;
   }
-  const ball = bodyState(world.ball);
   for (const value of [ball.x, ball.y, ball.angle, ball.vx, ball.vy, ball.angularVelocity]) {
     buffer.writeFloatBE(value, offset);
     offset += 4;
   }
   return buffer;
+}
+
+function cameraSafeSnapshot(packet) {
+  if (!packet || packet[0] !== 5 || packet.length < 6 + CLIENT_SLOTS * 33 + 24) return packet;
+  const safe = Buffer.from(packet);
+  const ballOffset = 6 + CLIENT_SLOTS * 33;
+  const fallbackX = safe.readFloatBE(ballOffset);
+  const fallbackY = safe.readFloatBE(ballOffset + 4);
+  for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
+    const offset = 6 + slot * 33;
+    const x = safe.readFloatBE(offset);
+    const y = safe.readFloatBE(offset + 4);
+    if (x >= -20 && x <= 120 && y >= -20 && y <= 80) continue;
+    safe.writeFloatBE(fallbackX, offset);
+    safe.writeFloatBE(fallbackY, offset + 4);
+    for (const componentOffset of [8, 12, 16, 20, 28]) safe.writeFloatBE(0, offset + componentOffset);
+  }
+  return safe;
 }
 
 function goalPacket(world, team, scorer, assist, speed) {
@@ -460,14 +490,14 @@ function awardPoints(world, slot, type, points = ACTION_POINTS[type] || 0, useCo
   return actionPacket(slot, type, points);
 }
 
-function gameOverPacket(world) {
+function gameOverPacket(world, postgameMs = POSTGAME_MS) {
   // Opcode 14 is the stock end-of-game summary with goals, assists, saves and
   // points for every client slot. The client calculates MVP from these rows.
   const buffer = Buffer.alloc(9 + CLIENT_SLOTS * 7 + 16);
   buffer[0] = 14;
   buffer.writeInt16BE(world.scores[0], 1);
   buffer.writeInt16BE(world.scores[1], 3);
-  buffer.writeInt32BE(POSTGAME_MS, 5);
+  buffer.writeInt32BE(postgameMs, 5);
   let offset = 9;
   for (const stats of world.stats) {
     buffer[offset++] = stats.goals;
@@ -571,6 +601,121 @@ function replayStatePacket(recorded, turn) {
   buffer[1] = 7;
   buffer.writeInt32BE(turn, 2);
   return buffer;
+}
+
+function postgameGoalFramePacket(recorded, index, total) {
+  const packet = Buffer.alloc(4 + (CLIENT_SLOTS + 1) * 8);
+  packet[0] = 26;
+  packet[1] = 7;
+  packet[2] = index;
+  packet[3] = total;
+  for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
+    const source = 6 + slot * 33;
+    packet.writeFloatBE(recorded.readFloatBE(source), 4 + slot * 8);
+    packet.writeFloatBE(recorded.readFloatBE(source + 4), 8 + slot * 8);
+  }
+  const ballSource = 6 + CLIENT_SLOTS * 33;
+  packet.writeFloatBE(recorded.readFloatBE(ballSource), 4 + CLIENT_SLOTS * 8);
+  packet.writeFloatBE(recorded.readFloatBE(ballSource + 4), 8 + CLIENT_SLOTS * 8);
+  return packet;
+}
+
+function postgameGoalStartPacket(clip, index, total) {
+  const scorer = String(clip?.goal?.scorerName || "Uncredited").slice(0, 32);
+  const assist = String(clip?.goal?.assistName || "None").slice(0, 32);
+  const packet = Buffer.alloc(10 + 2 * (scorer.length + assist.length));
+  packet[0] = 26;
+  packet[1] = 6;
+  packet[2] = index;
+  packet[3] = total;
+  packet.writeFloatBE(Number(clip?.goal?.speed) || 0, 4);
+  const offset = putString(packet, 8, scorer);
+  putString(packet, offset, assist);
+  return packet;
+}
+
+function goalSpeedsPacket(arena) {
+  const speeds = arena.goalClips.slice(0, 255).map((clip) => Number(clip?.goal?.speed) || 0);
+  const packet = Buffer.alloc(3 + speeds.length * 4);
+  packet[0] = 26; packet[1] = 18; packet[2] = speeds.length;
+  speeds.forEach((speed, index) => packet.writeFloatBE(speed, 3 + index * 4));
+  return packet;
+}
+
+// A complete six-second, 60 Hz clip is sent once. Playback is then entirely
+// local to each browser, so selecting, pausing or skipping never affects anyone.
+function postgameGoalClipPacket(clip, index, total) {
+  const frames = (clip?.frames || []).slice(-FAST_POSTGAME_PLAYBACK_TICKS);
+  const valuesPerFrame = CLIENT_SLOTS * 3 + 2;
+  const packet = Buffer.alloc(6 + frames.length * valuesPerFrame * 4);
+  packet[0] = 26;
+  packet[1] = 17;
+  packet[2] = index;
+  packet[3] = total;
+  packet.writeUInt16BE(frames.length, 4);
+  let target = 6;
+  for (const recorded of frames) {
+    for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
+      const source = 6 + slot * 33;
+      packet.writeFloatBE(recorded.readFloatBE(source), target); target += 4;
+      packet.writeFloatBE(recorded.readFloatBE(source + 4), target); target += 4;
+      packet.writeFloatBE(recorded.readFloatBE(source + 8), target); target += 4;
+    }
+    const ballSource = 6 + CLIENT_SLOTS * 33;
+    packet.writeFloatBE(recorded.readFloatBE(ballSource), target); target += 4;
+    packet.writeFloatBE(recorded.readFloatBE(ballSource + 4), target); target += 4;
+  }
+  return packet;
+}
+
+function sendLocalGoalLibrary(arena) {
+  for (let index = 0; index < arena.goalClips.length; index++) {
+    const clip = arena.goalClips[index];
+    arenaSend(arena, postgameGoalStartPacket(clip, index, arena.goalClips.length));
+    arenaSend(arena, postgameGoalClipPacket(clip, index, arena.goalClips.length));
+  }
+}
+
+function postgameSummaryPacket(winner, mvpName) {
+  const name = String(mvpName || "Uncredited").slice(0, 32);
+  const packet = Buffer.alloc(4 + name.length * 2);
+  packet[0] = 26;
+  packet[1] = 16;
+  packet[2] = winner;
+  putString(packet, 3, name);
+  return packet;
+}
+
+function buildGoalClipNcr(arena, indexes) {
+  const selected = indexes.flatMap((index) => arena.goalClips[index]?.frames || []);
+  const frames = selected.length ? selected : [statePacket(arena.world)];
+  const converted = frames.map((snapshot, turn) => {
+    const frame = ncrFrameFromStatePacket(snapshot, arena.world.boosts);
+    frame.writeInt32BE(turn, 0);
+    return frame;
+  });
+  const events = [];
+  for (let slot = 0; slot < CLIENT_SLOTS; slot++) {
+    const name = arena.world.players[slot]?.name;
+    if (name) events.push({ turn: 0, type: 200, slot1: slot, slot2: 255, speed: 0, name });
+  }
+  let offset = 0;
+  for (const index of indexes) {
+    const clip = arena.goalClips[index];
+    if (!clip) continue;
+    events.push({ turn: offset + Math.max(0, clip.frames.length - Math.round(PHYSICS_HZ * 0.3)), type: 202,
+      slot1: clip.goal.scorer, slot2: clip.goal.assist, speed: clip.goal.speed, name: "" });
+    offset += clip.frames.length;
+  }
+  const header = Buffer.alloc(13);
+  header.writeInt32BE(1, 0);
+  header[4] = 4;
+  header.writeInt32BE(0, 5);
+  header.writeInt32BE(converted.length, 9);
+  const encodedEvents = events.map(ncrEventBuffer);
+  const eventCount = Buffer.alloc(4);
+  eventCount.writeInt32BE(encodedEvents.length, 0);
+  return Buffer.concat([header, ...converted, eventCount, ...encodedEvents]);
 }
 
 function detectGoal(world) {
@@ -743,6 +888,7 @@ function simulate(world) {
 const arenas = new Map();
 const privateArenas = new Map();
 const activeReservations = new Map();
+const activeQuickJoinTokens = new Map();
 let nextArenaId = 1;
 
 function playerSnapshot(player) {
@@ -806,6 +952,15 @@ function createArena({ kind = "public", partyCode = null, gameMode = "normal" } 
     replaySkipVotes: new Set(),
     rematchVotes: new Set(),
     rematchTimer: null,
+    goalClips: [],
+    pendingGoalClip: null,
+    postgameReplayTimer: null,
+    postgameReplayClip: 0,
+    postgameReplayFrame: 0,
+    postgameReplayFrames: [],
+    postgameReplaySkipVotes: new Set(),
+    postgameDurationMs: POSTGAME_MS,
+    postgameEndsAt: 0,
     fullReplayFrames: [],
     lastReplayTurn: -1,
     cachedReplay: null,
@@ -840,7 +995,10 @@ function chooseBalancedSlot(arena, preferredTeam = null) {
 }
 
 function getOpenArena(gameMode = "normal") {
-  return [...arenas.values()].find((arena) => arena.kind === "public" && arena.gameMode === gameMode && arena.phase !== "ended" && arena.phase !== "retired" && freeSlots(arena).length) || createArena({ gameMode });
+  const open = [...arenas.values()]
+    .filter((arena) => arena.kind === "public" && arena.gameMode === gameMode && arena.phase !== "ended" && arena.phase !== "retired" && freeSlots(arena).length)
+    .sort((left, right) => right.connections.size - left.connections.size || Number(right.started) - Number(left.started) || left.id - right.id);
+  return open[0] || createArena({ gameMode });
 }
 
 function getPrivateArena(partyCode, gameMode = "normal") {
@@ -854,8 +1012,9 @@ function arenaSend(arena, payload, opcode = 2) {
   for (const connection of arena.connections.values()) {
     if (connection.ready && !connection.cleaned) connection.send(payload, opcode);
   }
+  const spectatorPayload = payload?.[0] === 5 ? cameraSafeSnapshot(payload) : payload;
   for (const spectator of arena.spectators) {
-    if (spectator.ready && !spectator.cleaned) spectator.send(payload, opcode);
+    if (spectator.ready && !spectator.cleaned) spectator.send(spectatorPayload, opcode);
   }
 }
 
@@ -918,6 +1077,84 @@ function saveArenaReplayFrame(arena, snapshot) {
   arena.cachedReplay = null;
 }
 
+function activePostgameReplayConnections(arena) {
+  return [...arena.connections.values()].filter((connection) => connection.ready && !connection.cleaned && !connection.spectator);
+}
+
+function stopPostgameGoalReel(arena, notify = true) {
+  if (arena.postgameReplayTimer) clearInterval(arena.postgameReplayTimer);
+  arena.postgameReplayTimer = null;
+  arena.postgameReplaySkipVotes.clear();
+  if (notify) arenaSend(arena, Buffer.from([26, 9]));
+}
+
+function beginPostgameGoalClip(arena, index) {
+  if (index >= arena.goalClips.length) {
+    stopPostgameGoalReel(arena, false);
+    arenaSend(arena, Buffer.from([26, 15]));
+    // SUPER NC temporarily replaces the result view with native fullscreen
+    // playback, so restore it afterward. Normal 4v4 never leaves its result
+    // view; re-sending game-over there caused the winner panel to flash.
+    if (arena.gameMode === "fast")
+      arenaSend(arena, gameOverPacket(arena.world, Math.max(0, arena.postgameEndsAt - Date.now())));
+    return;
+  }
+  arena.postgameReplayClip = index;
+  arena.postgameReplayFrame = 0;
+  arena.postgameReplaySkipVotes.clear();
+  const clip = arena.goalClips[index];
+  // Goal history is cleared at every normal and overtime kickoff. Taking only
+  // the final six seconds therefore cannot cross into the previous goal or
+  // regulation; a faster goal naturally begins exactly at that kickoff.
+  arena.postgameReplayFrames = clip.frames.slice(-FAST_POSTGAME_PLAYBACK_TICKS);
+  arenaSend(arena, postgameGoalStartPacket(clip, index, arena.goalClips.length));
+  arenaSend(arena, Buffer.from([26, 12, 0, activePostgameReplayConnections(arena).length]));
+  // SUPER NC uses NitroClash's native fullscreen renderer. Normal hosted 4v4
+  // keeps its untouched result screen and receives only lightweight mini frames.
+  if (arena.gameMode === "fast")
+    arenaSend(arena, replayStartPacket(arena.world.turn, arena.postgameReplayFrames.length));
+}
+
+function advancePostgameGoalClip(arena) {
+  beginPostgameGoalClip(arena, arena.postgameReplayClip + 1);
+}
+
+function startPostgameGoalReel(arena) {
+  stopPostgameGoalReel(arena, false);
+  if (!arena.goalClips.length) return;
+  beginPostgameGoalClip(arena, 0);
+  arena.postgameReplayTimer = setInterval(() => {
+    if (arena.phase !== "ended") return stopPostgameGoalReel(arena);
+    const clip = arena.goalClips[arena.postgameReplayClip];
+    if (!clip) return stopPostgameGoalReel(arena);
+    const frames = arena.postgameReplayFrames;
+    const frame = frames[Math.min(arena.postgameReplayFrame, frames.length - 1)];
+    if (frame) arenaSend(arena, arena.gameMode === "fast"
+      ? replayStatePacket(frame, arena.world.turn + arena.postgameReplayFrame)
+      : postgameGoalFramePacket(frame, arena.postgameReplayClip, arena.goalClips.length));
+    arena.postgameReplayFrame += 1; // Preserve every stored 60 Hz physics frame.
+    if (arena.postgameReplayFrame >= frames.length) advancePostgameGoalClip(arena);
+  }, TICK_MS);
+  arena.postgameReplayTimer.unref?.();
+}
+
+function maybeCompletePostgameReplaySkip(arena) {
+  if (!arena?.postgameReplayTimer || arena.phase !== "ended") return false;
+  const active = activePostgameReplayConnections(arena);
+  if (!active.length || !active.every((connection) => arena.postgameReplaySkipVotes.has(connection))) return false;
+  advancePostgameGoalClip(arena);
+  return true;
+}
+
+function registerPostgameReplaySkip(connection) {
+  const arena = connection.arena;
+  if (!arena?.postgameReplayTimer || connection.spectator || !connection.ready || connection.cleaned) return false;
+  arena.postgameReplaySkipVotes.add(connection);
+  arenaSend(arena, Buffer.from([26, 12, arena.postgameReplaySkipVotes.size, activePostgameReplayConnections(arena).length]));
+  maybeCompletePostgameReplaySkip(arena);
+  return true;
+}
+
 function finishArena(arena) {
   if (arena.phase === "ended") return;
   const winner = arena.world.scores[0] > arena.world.scores[1] ? 0 : 1;
@@ -925,15 +1162,24 @@ function finishArena(arena) {
     .map((stats, slot) => ({ stats, slot }))
     .filter(({ slot }) => isPlayableSlot(arena.world, slot) && slot % 2 === winner)
     .sort((a, b) => b.stats.points - a.stats.points || a.slot - b.slot);
+  const mvpSlot = arena.world.stats
+    .map((stats, slot) => ({ stats, slot }))
+    .filter(({ slot }) => isPlayableSlot(arena.world, slot) && arena.world.players[slot]?.name)
+    .sort((a, b) => b.stats.points - a.stats.points || b.stats.goals - a.stats.goals || a.slot - b.slot)[0]?.slot;
   recordReplayEvent(arena.world, ACTION.VICTORY, winnerSlots[0]?.slot ?? winner, 255, 0, "");
   arena.phase = "ended";
   arena.rematchVotes.clear();
+  arena.postgameDurationMs = arena.gameMode === "fast" ? FAST_POSTGAME_MS : NORMAL_POSTGAME_MS;
+  arena.postgameEndsAt = Date.now() + arena.postgameDurationMs;
   arenaSend(arena, arenaStatsPacket(arena));
-  arenaSend(arena, gameOverPacket(arena.world));
+  arenaSend(arena, gameOverPacket(arena.world, arena.postgameDurationMs));
   if (arena.loopTimer) clearTimeout(arena.loopTimer);
   arena.loopTimer = null;
   if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
-  arena.rematchTimer = setTimeout(() => completeArenaRematch(arena), POSTGAME_MS);
+  // Keep NitroClash's normal end screen in both modes. Goal clips are copied to
+  // each client once and played independently in the optional corner player.
+  sendLocalGoalLibrary(arena);
+  arena.rematchTimer = setTimeout(() => completeArenaRematch(arena), arena.postgameDurationMs);
   arena.rematchTimer.unref?.();
 }
 
@@ -1015,6 +1261,7 @@ function retireEmptyArena(arena) {
   arena.loopTimer = null;
   if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
   arena.rematchTimer = null;
+  stopPostgameGoalReel(arena, false);
   arena.phase = "retired";
   arenas.delete(arena.id);
   if (arena.kind === "private" && privateArenas.get(`${arena.gameMode}:${arena.partyCode}`) === arena)
@@ -1047,7 +1294,8 @@ function runArenaTick(arena) {
         const recorded = statePacket(arena.world);
         saveArenaReplayFrame(arena, recorded);
         arena.history.push(recorded);
-        if (arena.history.length > REPLAY_TICKS) arena.history.shift();
+        const historyLimit = arena.gameMode === "fast" ? FAST_POSTGAME_GOAL_TICKS : REPLAY_TICKS;
+        if (arena.history.length > historyLimit) arena.history.shift();
         const goal = detectGoal(arena.world);
         if (goal) {
           const goalActions = recordGoal(arena.world, goal);
@@ -1058,11 +1306,38 @@ function runArenaTick(arena) {
           arenaSend(arena, arenaStatsPacket(arena));
           const assistText = goal.assist === 255 ? "no assist" : `assisted by slot ${goal.assist + 1}`;
           console.log(`Arena ${arena.id}: ${goal.team === 0 ? "Blue" : "Red"} goal — ${goal.scorer === 255 ? "uncredited scorer" : `scored by slot ${goal.scorer + 1}`}, ${assistText}`);
-          if (arena.world.overtime) {
-            finishArena(arena);
-          } else if (arena.world.rules.goalResetMs !== null) {
+          if (arena.world.rules.goalResetMs === null) {
+            // Normal hosted games still keep their usual immediate goal replay.
+            // Save the same kickoff-bounded native state frames so each goal can
+            // be shown again, fullscreen, after the match has finished.
+            arena.goalClips.push({
+              frames: arena.history.slice(-FAST_POSTGAME_PLAYBACK_TICKS),
+              goal: {
+                scorer: goal.scorer,
+                assist: goal.assist,
+                speed: goal.speed,
+                scorerName: goal.scorer === 255 ? "Uncredited" : (arena.world.players[goal.scorer]?.name || "Uncredited"),
+                assistName: goal.assist === 255 ? "None" : (arena.world.players[goal.assist]?.name || "Unknown"),
+              },
+            });
+            arenaSend(arena, goalSpeedsPacket(arena));
+          }
+          if (arena.world.rules.goalResetMs !== null) {
+            const tailTicks = Math.round(arena.world.rules.goalResetMs / TICK_MS);
+            arena.pendingGoalClip = {
+              frames: arena.history.slice(-Math.max(1, FAST_POSTGAME_GOAL_TICKS - tailTicks)),
+              goal: {
+                scorer: goal.scorer,
+                assist: goal.assist,
+                speed: goal.speed,
+                scorerName: goal.scorer === 255 ? "Uncredited" : (arena.world.players[goal.scorer]?.name || "Uncredited"),
+                assistName: goal.assist === 255 ? "None" : (arena.world.players[goal.assist]?.name || "Unknown"),
+              },
+            };
             arena.phase = "fast-goal-reset";
             arena.phaseTicks = 0;
+          } else if (arena.world.overtime) {
+            finishArena(arena);
           } else {
             arena.phase = "celebration";
             arena.phaseTicks = 0;
@@ -1090,22 +1365,45 @@ function runArenaTick(arena) {
         snapshot = arena.phase === "ended" ? null : statePacket(arena.world);
       } else if (arena.phase === "fast-goal-reset") {
         arena.world.state = 4;
+        applyArenaInputs(arena);
+        const events = simulate(arena.world);
+        for (const event of events) arenaSend(arena, event);
         arena.phaseTicks++;
         snapshot = statePacket(arena.world);
         saveArenaReplayFrame(arena, snapshot);
+        arena.pendingGoalClip?.frames.push(Buffer.from(snapshot));
         if (arena.phaseTicks >= Math.round(arena.world.rules.goalResetMs / TICK_MS)) {
+          if (arena.pendingGoalClip) {
+            arena.pendingGoalClip.frames = arena.pendingGoalClip.frames.slice(-FAST_POSTGAME_GOAL_TICKS);
+            arena.goalClips.push(arena.pendingGoalClip);
+            arenaSend(arena, goalSpeedsPacket(arena));
+            arena.pendingGoalClip = null;
+          }
           resumeGoalClock(arena.world);
-          arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
-          resetForKickoff(arena.world, arena.kickoffSpawns);
-          for (const slot of playableSlots(arena)) if (!arena.connections.has(slot)) parkSlot(arena, slot);
-          arena.phase = "playing";
-          arena.history = [];
-          arena.replayFrames = [];
-          const countdownMs = kickoffCountdownMs(arena.world, 0);
-          arena.startsAt = Date.now() + countdownMs;
-          arenaSend(arena, startPacket(arena.world, countdownMs));
-          snapshot = statePacket(arena.world);
-          arenaSend(arena, snapshot);
+          const finished = arena.world.overtime || (arena.world.turn >= arena.world.rules.regulationTicks && arena.world.scores[0] !== arena.world.scores[1]);
+          if (finished) {
+            arena.world.regulationFinished = true;
+            finishArena(arena);
+            snapshot = null;
+          } else {
+            if (arena.world.turn >= arena.world.rules.regulationTicks) {
+              arena.world.regulationFinished = true;
+              arena.world.overtime = true;
+              arena.world.turn = Math.max(arena.world.turn, arena.world.rules.regulationTicks + 1);
+              recordReplayEvent(arena.world, 203);
+            }
+            arena.kickoffSpawns = randomKickoffSpawns(arena.world.rules.maxPlayersPerTeam);
+            resetForKickoff(arena.world, arena.kickoffSpawns);
+            for (const slot of playableSlots(arena)) if (!arena.connections.has(slot)) parkSlot(arena, slot);
+            arena.phase = "playing";
+            arena.history = [];
+            arena.replayFrames = [];
+            const countdownMs = kickoffCountdownMs(arena.world, 0);
+            arena.startsAt = Date.now() + countdownMs;
+            arenaSend(arena, startPacket(arena.world, countdownMs));
+            snapshot = statePacket(arena.world);
+            arenaSend(arena, snapshot);
+          }
         }
       } else if (arena.phase === "celebration") {
         arena.world.state = 4;
@@ -1329,18 +1627,20 @@ function sendArenaEntry(connection, arena) {
     connection.send(arenaStatsPacket(arena));
     connection.send(statePacket(arena.world));
   }
+  connection.send(goalSpeedsPacket(arena));
 }
 
 function sendSpectatorEntry(connection, arena) {
   connection.send(Buffer.from([26, 0]));
   const focusSlot = connection.inGameSpectator ? connection.slot : [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
-  connection.send(controlPacket(arena.world, focusSlot, null));
+  connection.send(controlPacket(arena.world, focusSlot, null, true));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
-  connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now())));
+  connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now()), true));
   connection.send(arenaStatsPacket(arena));
   if (arena.gameMode === "fast") connection.send(scoreSyncPacket(arena.world));
-  connection.send(statePacket(arena.world));
+  connection.send(statePacket(arena.world, true));
+  connection.send(goalSpeedsPacket(arena));
   if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
 }
 
@@ -1371,6 +1671,7 @@ function changeConnectionMatch(connection) {
     previousArena.connections.delete(previousSlot);
   previousArena.replaySkipVotes.delete(connection);
   previousArena.rematchVotes.delete(connection);
+  previousArena.postgameReplaySkipVotes.delete(connection);
   parkSlot(previousArena, previousSlot);
   arenaSend(previousArena, namePacket(previousSlot, ""));
 
@@ -1384,12 +1685,13 @@ function changeConnectionMatch(connection) {
     ? assignPrivateConnection(connection)
     : assignPublicConnection(connection);
   maybeStartReadyRematch(previousArena);
+  maybeCompletePostgameReplaySkip(previousArena);
   if (assignment.error) {
     console.error(`Could not change match for ${connection.username}: ${assignment.error}`);
     return false;
   }
 
-  if (previousArena.connections.size === 0 && previousArena.reservedSlots.size === 0)
+  if (previousArena.phase !== "retired" && previousArena.connections.size === 0 && previousArena.reservedSlots.size === 0)
     retireEmptyArena(previousArena);
   sendArenaEntry(connection, assignment.arena);
   console.log(`Change team ${connection.username}: arena ${previousArena.id} → ${assignment.arena.id}, slot ${assignment.slot + 1}`);
@@ -1432,6 +1734,7 @@ function detachFinishedConnection(arena, slot, connection) {
 function completeArenaRematch(arena) {
   if (arena.rematchTimer) clearTimeout(arena.rematchTimer);
   arena.rematchTimer = null;
+  stopPostgameGoalReel(arena);
   if (arena.phase !== "ended" || arena.phase === "retired") return false;
 
   // A finished match cannot carry reconnect reservations into the next game.
@@ -1477,6 +1780,13 @@ function completeArenaRematch(arena) {
   arena.replayIndex = 0;
   arena.replaySkipVotes.clear();
   arena.rematchVotes.clear();
+  arena.goalClips = [];
+  arena.pendingGoalClip = null;
+  arena.postgameReplayClip = 0;
+  arena.postgameReplayFrame = 0;
+  arena.postgameReplayFrames = [];
+  arena.postgameDurationMs = POSTGAME_MS;
+  arena.postgameEndsAt = 0;
     arena.fullReplayFrames = [];
   arena.lastReplayTurn = -1;
   arena.cachedReplay = null;
@@ -1588,7 +1898,7 @@ function checkConnectionLifecycle(connection,now=Date.now()) {
   if(connection.cleaned)return;
   if(now-connection.lastPongAt>Number(process.env.NC_CONNECTION_TIMEOUT_MS || 15000)) {connection.close("Connection timed out");return;}
   if(connection.ready && connection.arena?.phase!=="playing")connection.lastActivityAt=now;
-  if(!connection.spectator && connection.ready && connection.arena?.phase==="playing" && now>connection.arena.startsAt && now-connection.lastActivityAt>Number(process.env.NC_IDLE_TIMEOUT_MS || 30000)) {
+  if(!connection.spectator && connection.ready && connection.arena?.phase==="playing" && now>connection.arena.startsAt && now-connection.lastActivityAt>Number(process.env.NC_IDLE_TIMEOUT_MS || DEFAULT_IDLE_TIMEOUT_MS)) {
     connection.noReconnect=true;connection.send(Buffer.from([12]));connection.close("Removed for inactivity");
   }
 }
@@ -1616,6 +1926,7 @@ function installSharedUpgradeHandler(serverInstance) {
       pending: Buffer.alloc(0),
       lastPongAt:Date.now(),lastActivityAt:Date.now(),
       joinArenaId:Number(upgradeUrl.searchParams.get("joinArena")) || null,
+      quickJoinToken:/^[A-Za-z0-9_-]{8,80}$/.test(upgradeUrl.searchParams.get("quickJoinToken") || "") ? upgradeUrl.searchParams.get("quickJoinToken") : null,
       username: "Player",
       reservationKey: 0,
       arena: null,
@@ -1664,6 +1975,19 @@ function installSharedUpgradeHandler(serverInstance) {
               connection.send(Buffer.from([26, 2, 2])); // Ghost movement supported.
               break;
             }
+            if (packet[1] === 8) break; // Legacy shared-skip packet: intentionally ignored.
+            if (packet[1] === 10 && packet.length === 3 && connection.ready && connection.arena?.phase === "ended") {
+              const arena = connection.arena;
+              const requested = packet[2];
+              const indexes = requested === 255
+                ? arena.goalClips.map((_, index) => index)
+                : requested < arena.goalClips.length ? [requested] : [];
+              if (indexes.length) {
+                const replay = buildGoalClipNcr(arena, indexes);
+                connection.send(Buffer.concat([Buffer.from([26, 11, requested]), replay]));
+              }
+              break;
+            }
             handleSpectatorChat(connection, packet);
             break;
           case 28:
@@ -1701,6 +2025,14 @@ function installSharedUpgradeHandler(serverInstance) {
             connection.reservationKey = packet.length >= 5 ? packet.readInt32BE(1) : 0;
             const name = readString(packet, 5);
             connection.username = name.value || "Player";
+            if (connection.quickJoinToken) {
+              const activeQuickJoin = activeQuickJoinTokens.get(connection.quickJoinToken);
+              if (activeQuickJoin && activeQuickJoin !== connection && !activeQuickJoin.cleaned) {
+                connection.close("Join this match already opened");
+                break;
+              }
+              activeQuickJoinTokens.set(connection.quickJoinToken, connection);
+            }
             const active = activeReservations.get(connection.reservationKey);
             if (active && active !== connection && !active.cleaned) {
               if (connection.reconnectRequested) {
@@ -1837,6 +2169,8 @@ function installSharedUpgradeHandler(serverInstance) {
       clearInterval(connection.lifecycleTimer);
       if (activeReservations.get(connection.reservationKey) === connection)
         activeReservations.delete(connection.reservationKey);
+      if (connection.quickJoinToken && activeQuickJoinTokens.get(connection.quickJoinToken) === connection)
+        activeQuickJoinTokens.delete(connection.quickJoinToken);
       const arena = connection.arena;
       if (connection.spectator) {
         arena?.spectators.delete(connection);
@@ -1853,13 +2187,14 @@ function installSharedUpgradeHandler(serverInstance) {
       if (arena.connections.get(slot) === connection) arena.connections.delete(slot);
       arena.replaySkipVotes.delete(connection);
       arena.rematchVotes.delete(connection);
+      arena.postgameReplaySkipVotes.delete(connection);
       parkSlot(arena, slot);
       arenaSend(arena, namePacket(slot, ""));
       if (arena.kind === "private" && arena.phase !== "ended") {
         if(!connection.noReconnect)rememberReconnectSession(connection, arena, slot, playerState);
         maybeCompleteReplaySkip(arena);
       } else if (arena.phase !== "ended") {
-        rememberReconnectSession(connection, arena, slot, playerState);
+        if(!connection.noReconnect)rememberReconnectSession(connection, arena, slot, playerState);
         maybeCompleteReplaySkip(arena);
         if (arena.connections.size === 0) {
           const retirementTimer = setTimeout(() => {
@@ -1870,6 +2205,7 @@ function installSharedUpgradeHandler(serverInstance) {
         }
       } else {
         maybeStartReadyRematch(arena);
+        maybeCompletePostgameReplaySkip(arena);
       }
       console.log(`Disconnect ${connection.username} from arena ${arena.id}, slot ${slot + 1}; ${arena.kind === "private" ? "private slot released; reconnect only while free" : "public slot released immediately"}`);
     };
@@ -2216,6 +2552,7 @@ export {
   ACTION,
   ACTION_POINTS,
   buildNcrReplay,
+  buildGoalClipNcr,
   changeConnectionMatch,
   chatPacket,
   completeArenaRematch,
@@ -2224,6 +2561,8 @@ export {
   finishArena,
   gameOverPacket,
   createArena,
+  getOpenArena,
+  arenas,
   liveStatsPacket,
   makeWorld,
   mapPacket,
@@ -2232,6 +2571,7 @@ export {
   scoreSyncPacket,
   registerRematchVote,
   registerReplaySkipVote,
+  registerPostgameReplaySkip,
   runArenaTick,
   handleSpectatorChat,
   sendSpectatorEntry,

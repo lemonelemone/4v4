@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.24.5
+// @version      3.28.0
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -39,6 +39,168 @@
   let fastGoalClearTimer = null;
   let latestGameStage = null;
   let clearFastGoalOverlayNow = () => {};
+  let goalReelCurrent = 0;
+  let goalReelTotal = 0;
+  let goalReelDetails = [];
+  let goalPlayerClips = [];
+  let goalPlayerMode = "replay";
+  let goalPlayerSlideshow = false;
+  let goalPlayerClosed = false;
+  let goalPlayerStartedAt = 0;
+  let goalPlayerFrame = 0;
+  let goalPlayerAnimation = 0;
+  let matchGoalSpeeds = [];
+  let superMatchEnded = false;
+  let superEndStatsVisible = true;
+  function showReplayElement(element, visible, display = "block") {
+    if (!element || element.dataset.ncReplayVisible === String(visible)) return;
+    element.dataset.ncReplayVisible = String(visible);
+    if (!visible) {
+      element.style.opacity = "0";
+      element.style.display = "none";
+      return;
+    }
+    element.style.display = display;
+    element.style.opacity = "0";
+    requestAnimationFrame(() => {
+      if (element.dataset.ncReplayVisible === "true") element.style.opacity = "1";
+    });
+  }
+  function setSuperEndStatsVisible(visible) {
+    superEndStatsVisible = true;
+    document.documentElement?.classList.remove("nc-super-hide-end-stats", "nc-hosted-postgame-replay", "nc-replay-tab-stats");
+  }
+  function refreshSuperEndStatsControl() {
+    const button = document.getElementById("nc-super-stats-toggle");
+    if (button) button.style.display = "none";
+    const actions = document.getElementById("nc-super-end-actions");
+    if (actions) actions.style.display = "none";
+  }
+  function setGoalReelVisible(visible) {
+    const player = document.getElementById("nc-goal-reel");
+    showReplayElement(player, Boolean(visible && !goalPlayerClosed && goalReelTotal));
+  }
+  function refreshSuperReplaySummary() {
+    const player = document.getElementById("nc-goal-reel");
+    if (!player) return;
+    player.querySelector("[data-nc-goal-title]").textContent = goalReelTotal
+      ? `GOAL ${goalReelCurrent + 1}/${goalReelTotal}` : "GOAL REPLAYS";
+    player.querySelector("[data-nc-goal-detail]").textContent = goalReelDetails[goalReelCurrent] || "Loading replay…";
+    player.querySelector("[data-nc-view-mode]").textContent = goalPlayerMode === "replay" ? "Simple replay" : "Replay";
+    player.querySelector("[data-nc-slideshow]").textContent = goalPlayerSlideshow ? "Stop" : "Play all";
+    player.querySelector("[data-nc-goal-prev]").disabled = goalReelTotal < 2;
+    player.querySelector("[data-nc-goal-next]").disabled = goalReelTotal < 2;
+    setGoalReelVisible(superMatchEnded);
+  }
+  function resetGoalPlayer() {
+    cancelAnimationFrame(goalPlayerAnimation);
+    goalPlayerAnimation = 0; goalPlayerSlideshow = false; goalPlayerClosed = false;
+    goalPlayerClips = []; goalReelDetails = []; goalReelCurrent = 0; goalReelTotal = 0;
+    setGoalReelVisible(false);
+  }
+  function drawGoalPlayerFrame(frame) {
+    const canvas = document.getElementById("nc-goal-reel-canvas");
+    const ctx = canvas?.getContext?.("2d");
+    if (!ctx || !frame) return;
+    const width = canvas.width, height = canvas.height;
+    ctx.clearRect(0, 0, width, height);
+    if (goalPlayerMode === "replay") {
+      ctx.fillStyle = "#6d982e"; ctx.fillRect(0, 0, width, height);
+      for (let stripe = 0; stripe < 10; stripe++) {
+        ctx.fillStyle = stripe % 2 ? "rgba(35,83,16,.19)" : "rgba(255,255,255,.04)";
+        ctx.fillRect(stripe * width / 10, 0, width / 10, height);
+      }
+    } else { ctx.fillStyle = "#234c2c"; ctx.fillRect(0, 0, width, height); }
+    ctx.strokeStyle = goalPlayerMode === "replay" ? "rgba(224,244,194,.62)" : "rgba(255,255,255,.58)"; ctx.lineWidth = 2;
+    ctx.strokeRect(8, 8, width - 16, height - 16);
+    ctx.beginPath(); ctx.moveTo(width / 2, 8); ctx.lineTo(width / 2, height - 8); ctx.stroke();
+    ctx.beginPath(); ctx.arc(width / 2, height / 2, 25, 0, Math.PI * 2); ctx.stroke();
+    const point = index => ({ x: frame[index * 3] / 100 * width, y: frame[index * 3 + 1] / 56.25 * height,
+      angle: frame[index * 3 + 2] });
+    for (let slot = 0; slot < 10; slot++) {
+      const p = point(slot); if (p.x < -10 || p.x > width + 10 || p.y < -10 || p.y > height + 10) continue;
+      const radius = goalPlayerMode === "replay" ? 7 : 5;
+      if (goalPlayerMode === "replay") { ctx.beginPath(); ctx.ellipse(p.x + 3, p.y + 4, radius, radius * .65, 0, 0, Math.PI * 2); ctx.fillStyle = "rgba(0,0,0,.28)"; ctx.fill(); }
+      ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.fillStyle = slot % 2 ? "#e23b66" : "#24a4e8"; ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.stroke();
+      if (goalPlayerMode === "replay") { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + Math.cos(p.angle) * 11, p.y + Math.sin(p.angle) * 11); ctx.stroke(); }
+    }
+    const ball = { x: frame[30] / 100 * width, y: frame[31] / 56.25 * height };
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, goalPlayerMode === "replay" ? 7 : 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff"; ctx.fill(); ctx.strokeStyle = "#222"; ctx.lineWidth = 2; ctx.stroke();
+  }
+  function playGoal(index, slideshow = false) {
+    if (!goalReelTotal) return;
+    goalReelCurrent = (index + goalReelTotal) % goalReelTotal;
+    goalPlayerSlideshow = slideshow;
+    goalPlayerStartedAt = performance.now(); goalPlayerFrame = 0;
+    cancelAnimationFrame(goalPlayerAnimation);
+    const animate = now => {
+      const clip = goalPlayerClips[goalReelCurrent];
+      if (!clip?.length || goalPlayerClosed || !superMatchEnded) return;
+      goalPlayerFrame = Math.min(clip.length - 1, Math.floor((now - goalPlayerStartedAt) * 60 / 1000));
+      drawGoalPlayerFrame(clip[goalPlayerFrame]);
+      if (goalPlayerFrame < clip.length - 1) goalPlayerAnimation = requestAnimationFrame(animate);
+      else if (goalPlayerSlideshow && goalReelCurrent + 1 < goalReelTotal) playGoal(goalReelCurrent + 1, true);
+      else { goalPlayerSlideshow = false; refreshSuperReplaySummary(); }
+    };
+    refreshSuperReplaySummary();
+    goalPlayerAnimation = requestAnimationFrame(animate);
+  }
+  function downloadGoalNcr(index) {
+    if (spectatorChatSocket?.readyState === 1) spectatorChatSocket.send(new Uint8Array([26, 10, index]));
+  }
+  function setGoalSpeedsVisible(visible) {
+    const panel = document.getElementById("nc-goal-speeds");
+    if (!panel) return;
+    panel.style.display = visible && hostedMatchActive && !superMatchEnded ? "block" : "none";
+    const list = panel.querySelector("[data-nc-goal-speeds-list]");
+    if (list) list.innerHTML = matchGoalSpeeds.length
+      ? matchGoalSpeeds.map((speed, index) => `<div>Goal ${index + 1} speed: <strong>${speed} km/h</strong></div>`).join("")
+      : "<div>No goals yet</div>";
+  }
+  function receiveGoalReel(bytes) {
+    if (bytes[1] === 6) {
+      const index = bytes[2]; goalReelTotal = bytes[3]; superMatchEnded = true;
+      if (bytes.length >= 10) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const readText = (offset) => {
+          const length = bytes[offset++] || 0;
+          let value = "";
+          for (let index = 0; index < length && offset + 1 < bytes.length; index++, offset += 2)
+            value += String.fromCharCode(view.getUint16(offset));
+          return { value, offset };
+        };
+        const scorer = readText(8);
+        const assist = readText(scorer.offset);
+        goalReelDetails[index] = `${scorer.value || "Uncredited"} • Assist: ${assist.value || "None"} • ${Math.round(view.getFloat32(4) * 3.6)} km/h`;
+      }
+      refreshSuperReplaySummary();
+    } else if (bytes[1] === 17 && bytes.length >= 6) {
+      const index = bytes[2], total = bytes[3], count = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(4);
+      const values = 32, required = 6 + count * values * 4;
+      if (bytes.length < required) return;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength), frames = [];
+      let offset = 6;
+      for (let frameIndex = 0; frameIndex < count; frameIndex++) {
+        const frame = new Float32Array(values);
+        for (let value = 0; value < values; value++, offset += 4) frame[value] = view.getFloat32(offset);
+        frames.push(frame);
+      }
+      goalReelTotal = total; goalPlayerClips[index] = frames;
+      if (index === 0 && !goalPlayerClosed) playGoal(0, false);
+      else refreshSuperReplaySummary();
+    } else if (bytes[1] === 11 && bytes.length > 3) {
+      const requested = bytes[2], blob = new Blob([bytes.slice(3)], { type: "application/octet-stream" });
+      const link = document.createElement("a"), url = URL.createObjectURL(blob);
+      link.href = url; link.download = requested === 255 ? "nitroclash-all-goals.ncr" : `nitroclash-goal-${requested + 1}.ncr`;
+      document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } else if (bytes[1] === 18 && bytes.length >= 3) {
+      const count = bytes[2], view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      if (bytes.length >= 3 + count * 4) matchGoalSpeeds = Array.from({ length: count }, (_, index) => Math.round(view.getFloat32(3 + index * 4) * 3.6));
+    }
+  }
   function syncFastGoalDom() {
     const root = document.documentElement;
     if (!root) return;
@@ -47,7 +209,9 @@
       style.id = "nc-super-goal-style";
       style.textContent = `
         html.nc-super-match #goal,
-        html.nc-super-match #goal .bottom { display: none !important; }
+        html.nc-super-match #goal .bottom,
+        html.nc-super-match #inGameScore { display: none !important; }
+        html.nc-super-match.nc-super-hide-end-stats #game-summary .global-table { display: none !important; }
       `;
       (document.head || root).appendChild(style);
     }
@@ -59,8 +223,11 @@
     const scoreboard = document.getElementById("nc-super-scoreboard");
     if (!scoreboard) return;
     const homepage = document.getElementById("homepage");
-    const visible = hostedMatchActive && hostedMatchVariant === "fast" && homepage &&
-      (homepage.style.display === "none" || (win.getComputedStyle && win.getComputedStyle(homepage).display === "none"));
+    const homepageVisible = Boolean(homepage && homepage.style.display !== "none" &&
+      (!win.getComputedStyle || win.getComputedStyle(homepage).display !== "none"));
+    const badge = document.getElementById("nc-local-4v4-badge");
+    if (badge) badge.style.display = homepageVisible ? "block" : "none";
+    const visible = hostedMatchActive && hostedMatchVariant === "fast" && !superMatchEnded && !homepageVisible;
     scoreboard.style.display = visible ? "flex" : "none";
     const blue = scoreboard.querySelector?.("[data-nc-blue]");
     const red = scoreboard.querySelector?.("[data-nc-red]");
@@ -69,12 +236,14 @@
     blue.textContent = String(superScores[0]);
     red.textContent = String(superScores[1]);
     const remaining = Math.max(0, superMatchSeconds - Math.floor(superMatchTurn / 60));
-    clock.textContent = superMatchTurn > superMatchSeconds * 60
-      ? "OT" : `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+    if (superMatchTurn > superMatchSeconds * 60) {
+      const overtimeSeconds = Math.max(0, Math.floor((superMatchTurn - superMatchSeconds * 60) / 60));
+      clock.textContent = `+${Math.floor(overtimeSeconds / 60)}:${String(overtimeSeconds % 60).padStart(2, "0")}`;
+    } else clock.textContent = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
   }
   let preferredHostedRegion = hostedVariant === "fast" ? "NCFEU" : "NC4EU";
   let preferredOfficialRegion = "EU1";
-  let quickJoin=null,quickJoinStarted=false,joinOffer=null;
+  let quickJoin=null,quickJoinStarted=false,quickJoinConnectionStarted=false,joinOffer=null;
   try{const saved=JSON.parse(win.sessionStorage.getItem("nc4v4-quick-join")||"null");if(saved?.expires>Date.now() && Number.isInteger(saved.arenaId) && saved.arenaId>0 && ["NC4EU","NC4OLD","NCFEU","NCFOLD"].includes(saved.serverCode)){quickJoin=saved;hostedMode=true;hostedVariant=saved.serverCode.startsWith("NCF")?"fast":"normal";selectedMode=4;preferredHostedRegion=saved.serverCode;}}catch(_){}
   let lastActivitySent=0,refreshingNativeActivity=false;
   function markGameActivity(){if(spectatorChatSocket?.readyState===1 && Date.now()-lastActivitySent>1000){lastActivitySent=Date.now();spectatorChatSocket.send(new Uint8Array([29]));
@@ -82,7 +251,7 @@
   function refreshJoinButton(){
     let button=document.getElementById("nc-join-spectated-match");
     if(!button && document.body){button=document.createElement("button");button.id="nc-join-spectated-match";button.textContent="Join this match";button.style.cssText="position:fixed;top:42px;right:8px;z-index:10000;padding:8px 12px;border:0;border-radius:6px;background:#5488c4;color:white;cursor:pointer";
-      button.addEventListener("click",()=>{if(!joinOffer?.spaces)return;win.sessionStorage.setItem("nc4v4-quick-join",JSON.stringify({...joinOffer,expires:Date.now()+30000}));button.disabled=true;win.nitroclash.backToHomepage();});document.body.appendChild(button);}
+      button.addEventListener("click",()=>{if(!joinOffer?.spaces)return;const token=`${Date.now().toString(36)}-${createReservationKey().toString(36)}-${createReservationKey().toString(36)}`;quickJoin={...joinOffer,quickJoinToken:token,expires:Date.now()+30000};quickJoinStarted=false;quickJoinConnectionStarted=false;win.sessionStorage.setItem("nc4v4-quick-join",JSON.stringify(quickJoin));button.disabled=true;win.nitroclash.backToHomepage();});document.body.appendChild(button);}
     if(button)button.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 && joinOffer?.spaces>0 ? "block":"none";
   }
   let stockSelectMode = null;
@@ -291,16 +460,23 @@
     }
     closeMatchChat();
   }
-  // Chat owns game shortcuts and pointer controls until it is sent or cancelled.
-  for(const type of ["pointerdown","pointerup","mousedown","mouseup","mousemove","click","wheel"])win.addEventListener(type,event=>{
-    if(spectatorChatSocket?.readyState!==1 || document.activeElement?.id!=="chat-input")return;
-    event.stopImmediatePropagation();
-    if(event.target?.id!=="chat-input" || type==="wheel")event.preventDefault();
-  },{capture:true,passive:false});
+  // Keep pointer gameplay and end-screen buttons live while chat has focus.
+  // The keyboard handler below still prevents typed letters reaching the game.
+  win.addEventListener("contextmenu",event=>{
+    if(hostedMatchActive && spectatorChatSocket?.readyState===1)event.preventDefault();
+  },{capture:true});
   // Capture before the game's keyboard handlers, preserving normal text input.
   for(const type of ["keydown","keyup","keypress"]) win.addEventListener(type,event=>{
     if(refreshingNativeActivity)return;
     if(type==="keydown")markGameActivity();
+    const playerTyping=/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "") || event.target?.isContentEditable;
+    if(event.key==="Tab" && !playerTyping) setGoalSpeedsVisible(type==="keydown");
+    const goalPlayerVisible=document.getElementById("nc-goal-reel")?.style.display!=="none";
+    if(type==="keydown" && goalPlayerVisible && !playerTyping && (event.key==="ArrowLeft" || event.key==="ArrowRight")) {
+      event.preventDefault();event.stopImmediatePropagation();
+      playGoal(goalReelCurrent + (event.key==="ArrowLeft" ? -1 : 1));
+      return;
+    }
     if(consumedChatKey===event.key) {
       event.preventDefault();event.stopImmediatePropagation();
       if(type==="keyup")consumedChatKey=null;
@@ -355,7 +531,7 @@
     if(type==="keyup")observerKeys&=~bit;
     sendObserverKeys();
   },true);
-  win.addEventListener("blur",()=>{observerKeys=0;observerPointer=null;sendObserverKeys();});
+  win.addEventListener("blur",()=>{observerKeys=0;observerPointer=null;setGoalSpeedsVisible(false);document.documentElement?.classList.remove("nc-replay-tab-stats");sendObserverKeys();});
   document.addEventListener?.("focusin",event=>{if(/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "")){observerKeys=0;observerPointer=null;sendObserverKeys();}});
   setInterval(sendObserverKeys,50);
   function installObserverSensors() {
@@ -929,9 +1105,10 @@
     }
     if (spectatorSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}${inGameSpectatorSocket ? "ingameSpectate" : "spectate"}=1`;
     if (reconnectSocket) finalUrl += `${finalUrl.includes("?") ? "&" : "/?"}reconnect=1`;
+    let socketQuickJoin = null;
     if(isNitroSocket && socketIntent && !spectatorSocket && quickJoin) {
-      finalUrl+=(finalUrl.includes("?") ? "&":"/?")+"joinArena="+quickJoin.arenaId;
-      quickJoin=null;win.sessionStorage.removeItem("nc4v4-quick-join");
+      socketQuickJoin=quickJoin;quickJoinConnectionStarted=true;
+      finalUrl+=(finalUrl.includes("?") ? "&":"/?")+"joinArena="+quickJoin.arenaId+"&quickJoinToken="+encodeURIComponent(quickJoin.quickJoinToken || "legacy-"+quickJoin.arenaId);
     }
     if (isNitroSocket) console.log(`[nc-local-4v4] ${text} → ${finalUrl}`);
     const socket = protocols === undefined ? new NativeWebSocket(finalUrl) : new NativeWebSocket(finalUrl, protocols);
@@ -941,6 +1118,11 @@
       superMatchSeconds = 180;
       superMatchTurn = 0;
       superScores = [0, 0];
+      superMatchEnded = false;
+      resetGoalPlayer();
+      setSuperEndStatsVisible(false);
+      refreshSuperEndStatsControl();
+      setGoalReelVisible(false);
       fastGoalOverlayCleared = true;
       fastGoalBannerUntil = 0;
       clearTimeout(fastGoalClearTimer);
@@ -993,6 +1175,10 @@
             pendingPartyServer = null;
             pendingGameServer = null;
             playerJoinSent = true;
+            if (socketQuickJoin && quickJoin === socketQuickJoin) {
+              quickJoin = null;
+              win.sessionStorage.removeItem("nc4v4-quick-join");
+            }
             saveReconnectSession(privateRoute, Date.now() + 60000, gameServerCode);
             clearInterval(reconnectRefreshTimer);
             reconnectRefreshTimer = setInterval(() =>
@@ -1028,7 +1214,7 @@
             if(bytes.length===6 && spectatorSocket){joinOffer={spaces:bytes[1],arenaId:new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength).getUint32(2),serverCode:gameServerCode};refreshJoinButton();}
             return;
           }
-          if(bytes?.[0]===12){setTimeout(()=>socket.close(),0);}
+      if(bytes?.[0]===12){setTimeout(()=>socket.close(),0);}
           if (hostedMatchVariant === "fast" && bytes?.[0] === 6) {
             fastGoalOverlayCleared = true;
             fastGoalBannerUntil = 0;
@@ -1043,8 +1229,16 @@
             syncFastGoalDom();
             setTimeout(clearFastGoalOverlayNow, 0);
           }
+          if (spectatorChatSocket !== socket) {
+            event.stopImmediatePropagation?.();
+            return;
+          }
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
+            if ([6, 11, 17, 18].includes(bytes[1])) {
+              receiveGoalReel(bytes);
+              return;
+            }
             if (bytes[1] === 5 && bytes.length >= 6) {
               const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
               superScores = [view.getUint16(2), view.getUint16(4)];
@@ -1069,6 +1263,11 @@
             return;
           }
           if (bytes?.[0] === 2 && bytes.length >= 9) {
+            superMatchEnded = false;
+            matchGoalSpeeds = []; setGoalSpeedsVisible(false);
+            resetGoalPlayer();
+            setSuperEndStatsVisible(false);
+            refreshSuperEndStatsControl();
             superMatchSeconds = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(5);
             superMatchTurn = 0;
             superScores = [0, 0];
@@ -1078,9 +1277,15 @@
             superMatchTurn = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(2);
             refreshSuperScoreboard();
           }
-          if (hostedMatchVariant === "fast" && bytes?.[0] === 14) {
-            superMatchTurn = Math.max(superMatchTurn, superMatchSeconds * 60);
-            refreshSuperScoreboard();
+          if (hostedMatchActive && bytes?.[0] === 14) {
+            superMatchEnded = true;
+            setGoalSpeedsVisible(false);
+            setSuperEndStatsVisible(true);
+            refreshSuperEndStatsControl();
+            if (hostedMatchVariant === "fast") {
+              superMatchTurn = Math.max(superMatchTurn, superMatchSeconds * 60);
+              refreshSuperScoreboard();
+            }
           }
           if (!spectatorSocket && bytes?.[0] === 14) {
             matchEnded = true;
@@ -1526,7 +1731,7 @@
       if(spectatorChatSocket?.readyState===1 && ["kicked-inactivity","connection-lost"].some(id=>{const e=document.getElementById(id);return e && e.style.display==="block";}))spectatorChatSocket.close();
       if(quickJoin && !quickJoinStarted && win.nitroclash && document.getElementById("homepage-loaded")?.style.display==="block") {
         quickJoinStarted=true;
-        gameServerReady.then(()=>{changeNetworkMode(false,4,hostedVariant);win.nitroclash.clickPlay();setTimeout(()=>{if(quickJoin)win.nitroclash.clickTutoButton();},300);});
+        gameServerReady.then(()=>{changeNetworkMode(false,4,hostedVariant);win.nitroclash.clickPlay();setTimeout(()=>{if(quickJoin && !quickJoinConnectionStarted)win.nitroclash.clickTutoButton();},300);});
       }
       if (win.nitroclash && !win.__nc4v4InitialModeApplied &&
           document.getElementById("homepage-loaded")?.style.display === "block") {
@@ -1535,6 +1740,7 @@
       }
       refreshModeControls();
       refreshSuperScoreboard();
+      refreshSuperEndStatsControl();
       if (win.nitroclash && !win.nitroclash.clickPlay?.__nc4v4Wrapped) {
         const originalPlay = win.nitroclash.clickPlay;
         if (typeof originalPlay === "function") {
@@ -1660,10 +1866,84 @@
       document.body.appendChild(scoreboard);
       refreshSuperScoreboard();
     }
+    if (!document.getElementById("nc-goal-reel")) {
+      const reel = document.createElement("section");
+      reel.id = "nc-goal-reel";
+      reel.style.cssText = "display:none;position:fixed;right:12px;bottom:12px;z-index:999996;width:330px;height:260px;min-width:280px;min-height:220px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);box-sizing:border-box;overflow:hidden;color:#fff;background:rgba(20,25,30,.94);border:2px solid rgba(255,255,255,.86);border-radius:10px;box-shadow:0 7px 25px rgba(0,0,0,.55);font-family:Arial,sans-serif;transition:opacity .14s ease";
+      reel.innerHTML = `
+        <div data-nc-goal-drag style="height:31px;box-sizing:border-box;display:flex;align-items:center;gap:7px;padding:4px 5px 4px 9px;background:linear-gradient(90deg,#25334d,#4e2753);cursor:move;user-select:none">
+          <strong data-nc-goal-title style="font-size:12px;white-space:nowrap">GOAL REPLAYS</strong>
+          <span data-nc-goal-detail style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:9px;opacity:.9">Loading replay…</span>
+          <button data-nc-goal-close type="button" title="Close replay player" style="width:22px;height:22px;padding:0;border:0;border-radius:50%;background:#dc3f59;color:#fff;font:bold 14px Arial;cursor:pointer">×</button>
+        </div>
+        <canvas id="nc-goal-reel-canvas" width="640" height="360" aria-label="Personal goal replay" style="display:block;width:100%;height:calc(100% - 91px);background:#355f29;cursor:move"></canvas>
+        <div style="height:60px;box-sizing:border-box;display:flex;align-content:center;justify-content:center;gap:4px;flex-wrap:wrap;padding:5px;background:rgba(12,14,20,.98)">
+          <button data-nc-goal-prev type="button" title="Previous goal">◀</button><button data-nc-slideshow type="button">Play all</button><button data-nc-goal-next type="button" title="Next goal">▶</button>
+          <button data-nc-view-mode type="button">Simple replay</button><button data-nc-download-goal type="button">Goal NCR</button><button data-nc-download-all type="button">All NCR</button>
+        </div>
+        <div data-nc-goal-resize title="Drag to resize" style="position:absolute;right:0;bottom:0;width:17px;height:17px;cursor:nwse-resize;background:linear-gradient(135deg,transparent 45%,rgba(255,255,255,.9) 48%,rgba(255,255,255,.9) 56%,transparent 59%,transparent 68%,rgba(255,255,255,.9) 71%,rgba(255,255,255,.9) 79%,transparent 82%)"></div>`;
+      for (const button of reel.querySelectorAll("button:not([data-nc-goal-close])"))
+        button.style.cssText = "padding:4px 7px;border:1px solid rgba(255,255,255,.5);border-radius:5px;background:#f5f5f5;color:#252033;font:700 10px Arial;cursor:pointer";
+      document.body.appendChild(reel);
+      reel.querySelector("[data-nc-goal-close]").addEventListener("click", () => {
+        goalPlayerClosed = true; goalPlayerSlideshow = false; cancelAnimationFrame(goalPlayerAnimation); setGoalReelVisible(false);
+      });
+      reel.querySelector("[data-nc-goal-prev]").addEventListener("click", () => playGoal(goalReelCurrent - 1));
+      reel.querySelector("[data-nc-goal-next]").addEventListener("click", () => playGoal(goalReelCurrent + 1));
+      reel.querySelector("[data-nc-slideshow]").addEventListener("click", () => {
+        if (goalPlayerSlideshow) { goalPlayerSlideshow = false; refreshSuperReplaySummary(); }
+        else playGoal(0, true);
+      });
+      reel.querySelector("[data-nc-view-mode]").addEventListener("click", () => {
+        goalPlayerMode = goalPlayerMode === "replay" ? "simple" : "replay";
+        drawGoalPlayerFrame(goalPlayerClips[goalReelCurrent]?.[goalPlayerFrame]); refreshSuperReplaySummary();
+      });
+      reel.querySelector("[data-nc-download-goal]").addEventListener("click", () => downloadGoalNcr(goalReelCurrent));
+      reel.querySelector("[data-nc-download-all]").addEventListener("click", () => downloadGoalNcr(255));
+      let drag = null;
+      const startMove = event => {
+        if (event.button !== 0) return;
+        const box = reel.getBoundingClientRect();
+        drag = { type: "move", x: event.clientX, y: event.clientY, left: box.left, top: box.top };
+        reel.style.right = "auto"; reel.style.bottom = "auto"; event.preventDefault();
+      };
+      reel.querySelector("[data-nc-goal-drag]").addEventListener("pointerdown", event => { if (!event.target.closest("button")) startMove(event); });
+      reel.querySelector("canvas").addEventListener("pointerdown", startMove);
+      reel.querySelector("[data-nc-goal-resize]").addEventListener("pointerdown", event => {
+        if (event.button !== 0) return;
+        const box = reel.getBoundingClientRect();
+        reel.style.left = `${box.left}px`; reel.style.top = `${box.top}px`; reel.style.right = "auto"; reel.style.bottom = "auto";
+        drag = { type: "resize", x: event.clientX, y: event.clientY, width: box.width, height: box.height };
+        event.preventDefault(); event.stopPropagation();
+      });
+      win.addEventListener("pointermove", event => {
+        if (!drag) return;
+        if (drag.type === "move") {
+          reel.style.left = `${Math.max(0, Math.min(innerWidth - reel.offsetWidth, drag.left + event.clientX - drag.x))}px`;
+          reel.style.top = `${Math.max(0, Math.min(innerHeight - reel.offsetHeight, drag.top + event.clientY - drag.y))}px`;
+        } else {
+          const width = Math.max(280, Math.min(innerWidth - 16, drag.width + event.clientX - drag.x));
+          const height = Math.max(220, Math.min(innerHeight - 16, drag.height + event.clientY - drag.y));
+          reel.style.width = `${width}px`; reel.style.height = `${height}px`;
+          reel.style.left = `${Math.max(0, Math.min(reel.offsetLeft, innerWidth - width))}px`;
+          reel.style.top = `${Math.max(0, Math.min(reel.offsetTop, innerHeight - height))}px`;
+          drawGoalPlayerFrame(goalPlayerClips[goalReelCurrent]?.[goalPlayerFrame]);
+        }
+      }, true);
+      win.addEventListener("pointerup", () => { drag = null; }, true);
+      refreshSuperReplaySummary();
+    }
+    if (!document.getElementById("nc-goal-speeds")) {
+      const panel = document.createElement("aside");
+      panel.id = "nc-goal-speeds";
+      panel.style.cssText = "display:none;position:fixed;top:48px;right:12px;z-index:999997;max-height:50vh;overflow:hidden;padding:8px 10px;border:1px solid rgba(255,255,255,.8);border-radius:8px;background:rgba(20,23,32,.9);box-shadow:0 4px 16px rgba(0,0,0,.4);color:#fff;font:12px/1.45 Arial,sans-serif;pointer-events:none;text-shadow:0 1px 2px #000";
+      panel.innerHTML = '<strong style="display:block;margin-bottom:3px;font-size:11px;letter-spacing:.08em">GOAL SPEEDS</strong><div data-nc-goal-speeds-list>No goals yet</div>';
+      document.body.appendChild(panel);
+    }
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.24.5";
+    badge.textContent = "HOSTED 4v4 v3.28.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

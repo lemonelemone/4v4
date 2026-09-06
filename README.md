@@ -1,6 +1,16 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.24.5**
+Current release version: **3.28.0**
+
+Version 3.28.0 restores NitroClash's normal end screen for both SUPER NC and normal hosted 4v4. Every browser receives its own local goal library and optional corner replay player: local previous/next controls and Left/Right arrow keys, a Play all slideshow, Replay/Simple replay views, individual/all-goal NCR downloads, an X close button, canvas/header dragging, and corner resizing. These controls never change another player's replay. Holding Tab during a match adds a compact list of every goal's speed to the normal scoreboard, including earlier goals for players or spectators who joined later. A new kickoff synchronously clears the player and its saved clips. The fixed result wait is 50 seconds for SUPER NC and 60 seconds for normal 4v4 unless all remaining players rematch earlier. The isolated local package uses 15-second matches in both modes. Nothing was deployed.
+
+Version 3.27.0 separates the post-match presentation by mode. Normal hosted 4v4 keeps NitroClash's usual winner/results screen and adds only a small simplified goal viewer in the bottom-right corner; SUPER NC keeps the native fullscreen goal replay. Saved physics frames are now delivered at 60 Hz instead of 30 Hz. Normal 4v4 receives no native fullscreen replay packets and its game-over screen is sent only once, removing the flash between the winner announcement and replay. SUPER NC prepares its replay layer before the native result is painted, and every custom replay layer is cleared synchronously by the next kickoff. Replay headings and the top-right replay/skip count are text-only with shadows, with no grey panel. Nothing was deployed.
+
+Version 3.26.1 hides the SUPER NC scoreboard from the moment full time is received, throughout the fullscreen goal replays, and on the final results screen. A compact top-right replay status now shows the current replay number and an accurate live skip-vote count such as `REPLAY 1/3 • SKIPS 0/4`. Spectators are excluded from the required vote total because they cannot cast a replay-skip vote. Nothing was deployed.
+
+Version 3.26.0 replaces the framed and miniature post-match players with NitroClash's native fullscreen replay view. The replay sequence now runs after both SUPER NC and normal hosted 4v4 matches. Compact Rematch, Change team and Download full replay buttons remain centred at the bottom during playback; holding Tab temporarily shows the match stats. When every goal replay is finished, the added replay overlay and buttons disappear and NitroClash's original results screen returns unchanged. Each clip is still limited to the latest kickoff-bounded six seconds. Nothing was deployed.
+
+Version 3.25.6 shortens the displayed proper and miniature goal replays to at most six seconds. Because goal history is cleared at every post-goal and overtime kickoff, a goal scored sooner than six seconds after either kickoff begins exactly at that kickoff and cannot repeat the previous goal or pre-overtime play. Downloadable goal NCR files still contain up to ten seconds. It retains v3.25.5's normal light replay background and usual post-replay results screen. Nothing was deployed.
 
 Version 3.24.5 replaces the server's complete ball/contact physics path with the actual v3.22.1 implementation, rather than merely setting later tuning multipliers to neutral values. The server file is byte-for-byte identical to the v3.22.1 server: it uses the original fixed ball fixture, density and contact processing and contains no later radius, density or per-contact speed hooks. The userscript retains the fully suppressed SUPER NC goal overlay, `0:00` display fix and party-announcement stacking fix. Nothing was deployed.
 
@@ -92,11 +102,11 @@ During a goal replay, a left click/boost press votes to skip. The replay ends ea
 
 Stock party links and the **Private game** checkbox now route matches by their six-character party code. Each code owns an isolated arena, the displayed Team 1/Team 2 choice is preserved when the player name identifies one side, and private disconnects reserve that exact slot for 60 seconds. Public matchmaking never enters a private arena.
 
-In-game text and quick chat are relayed only to players in the same arena, with length and rate limits. At the results screen, **Change Team** leaves the ended match and enters an available non-full match; if none exists, the server creates a fresh arena and starts its kickoff. Selecting **Rematch** keeps that player in the same arena and team. When the 30-second results timer expires, all rematch voters begin a reset match with a normal 3-2-1-GO kickoff; players who did not select Rematch are detached from that finished arena.
+In-game text and quick chat are relayed only to players in the same arena, with length and rate limits. At the results screen, **Change Team** leaves the ended match and enters the busiest available non-full compatible match; if none exists, the server creates a fresh arena and starts its kickoff. Other players changing from the same finished game normally join that same new arena while it has space. Selecting **Rematch** keeps that player in the same arena and team. When the results timer expires, all rematch voters begin a reset match with a normal 3-2-1-GO kickoff; players who did not select Rematch are detached from that finished arena.
 
 The closed browser client has hard-coded layouts for 1v1, 2v2, 3v3 and 5v5. Normal hosted 4v4 uses the 5v5 layout while keeping one slot on each team for its two in-game spectators. SUPER NC uses all ten positions as players and therefore supports 5v5 without in-game spectator places.
 
-Goals trigger the stock explosion, a controllable three-second celebration, a five-second replay, a short replay celebration, and a fresh 3-2-1 kickoff. Goal scorer and assister use recent ball-touch tracking, and goal speed uses the ball velocity at the line.
+Normal hosted 4v4 goals trigger the stock explosion, a controllable three-second celebration, a five-second replay, a short replay celebration, and a fresh 3-2-1 kickoff. SUPER NC instead resets quickly without a live replay. After full time, both hosted modes retain their usual NitroClash results screen and offer an independent, movable and resizable goal player in the corner. Each browser can switch between detailed and simple rendering, select goals, play all goals, close the player, or download goal NCR files without affecting other users. Goal scorer and assister use recent ball-touch tracking, and goal speed uses the ball velocity at the line.
 
 At the end of regulation, a leading team wins immediately. A tied game resets to one overtime kickoff and the next goal ends the match. The stock results screen receives the final score, player goals, assists, saves, points and MVP selection.
 
@@ -124,7 +134,7 @@ Every normal kickoff randomly selects four of the five official 5v5 spawn-pad pa
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.24.5** badge appears on the homepage.
+4. Confirm that the orange **HOSTED 4v4 v3.28.0** badge appears on the homepage.
 5. Choose normal hosted **4 vs 4** or the separate two-line **SUPER / NC** button, then choose **Amsterdam** (VPS) or **Frankfurt** (Render). Choose **1 VS 1**, **2 VS 2**, **3 VS 3**, **5 VS 5** or **Classic** for NitroClash's original servers. **Train** remains the original local training mode. Mode changes update the server list immediately, without refreshing.
 6. Click Play. The normal hosted mode, Fast mode and original modes remain separate.
 
