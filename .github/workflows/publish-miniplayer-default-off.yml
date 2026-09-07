@@ -1,0 +1,62 @@
+name: Publish miniplayer default-off update
+
+on:
+  schedule:
+    # One scheduled run: 03:00 UK time on 8 September 2026.
+    - cron: "0 3 8 9 *"
+      timezone: "Europe/London"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-date-check:
+    runs-on: ubuntu-latest
+    outputs:
+      release_now: ${{ steps.check.outputs.release_now }}
+    steps:
+      - id: check
+        run: |
+          if [ "$(date -u +%F)" = "2026-09-08" ]; then
+            echo "release_now=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_now=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: release-date-check
+    if: needs.release-date-check.outputs.release_now == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable the opt-in miniplayer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("nitroclash-hosted-4v4.user.js")
+          text = path.read_text(encoding="utf-8")
+          changes = {
+              "// @version      3.31.0": "// @version      3.31.1",
+              "let miniplayerDisabled = false;\n  try { miniplayerDisabled = win.localStorage.getItem(\"nc4v4-miniplayer\") === \"off\"; } catch (_) {}": "let miniplayerDisabled = true;\n  try { miniplayerDisabled = win.localStorage.getItem(\"nc4v4-miniplayer\") !== \"on\"; } catch (_) {}",
+              'document.getElementById("nc-disable-miniplayer")': 'document.getElementById("nc-enable-miniplayer")',
+              'toggle.id="nc-disable-miniplayer"': 'toggle.id="nc-enable-miniplayer"',
+              "toggle.checked=miniplayerDisabled": "toggle.checked=!miniplayerDisabled",
+              "miniplayerDisabled=toggle.checked": "miniplayerDisabled=!toggle.checked",
+              'caption.textContent=" Disable miniplayer"': 'caption.textContent=" Enable Miniplayer (may cause lag)"',
+              "HOSTED 4v4 v3.31.0": "HOSTED 4v4 v3.31.1",
+          }
+          for old, new in changes.items():
+              if old not in text:
+                  raise SystemExit(f"Expected update text was not found: {old!r}")
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+      - name: Commit and publish the userscript
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nitroclash-hosted-4v4.user.js
+          git diff --cached --quiet || git commit -m "Publish miniplayer opt-in update"
+          git push
