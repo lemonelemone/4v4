@@ -13,7 +13,7 @@ const CELEBRATION_TICKS = PHYSICS_HZ * 3;
 const REPLAY_TICKS = PHYSICS_HZ * 5;
 const FAST_POSTGAME_GOAL_SECONDS = 10;
 const FAST_POSTGAME_GOAL_TICKS = PHYSICS_HZ * FAST_POSTGAME_GOAL_SECONDS;
-const FAST_POSTGAME_PLAYBACK_SECONDS = 6;
+const FAST_POSTGAME_PLAYBACK_SECONDS = 5;
 const FAST_POSTGAME_PLAYBACK_TICKS = PHYSICS_HZ * FAST_POSTGAME_PLAYBACK_SECONDS;
 const NORMAL_POSTGAME_MS = 60_000;
 const FAST_POSTGAME_MS = 50_000;
@@ -22,7 +22,7 @@ const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
 const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
 const DEFAULT_IDLE_TIMEOUT_MS = 20_000;
-const ADDON_PROTOCOL_VERSION = 29;
+const ADDON_PROTOCOL_VERSION = 32;
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
 const ALL_PLAYER_SLOTS = Object.freeze(Array.from({ length: CLIENT_SLOTS }, (_, slot) => slot));
 const PLAYER_RADIUS = 0.6103515625;
@@ -1022,12 +1022,9 @@ function arenaSend(arena, payload, opcode = 2) {
   for (const connection of arena.connections.values()) {
     if (connection.ready && !connection.cleaned) connection.send(payload, opcode);
   }
-  const spectatorPayload = payload?.[0] === 5 ? cameraSafeSnapshot(payload) : payload;
   for (const spectator of arena.spectators) {
-    if (spectator.ready && !spectator.cleaned) spectator.send(spectatorPayload, opcode);
+    if (spectator.ready && !spectator.cleaned) spectator.send(payload, opcode);
   }
-  // Keep camera-safe parked bodies hidden. Without this mask, ordinary
-  // spectators see the empty slots follow the ball as a row of player sprites.
   if (payload?.[0] === 10) {
     const occupied = occupiedSlotsPacket(arena);
     for (const connection of arena.connections.values())
@@ -1656,13 +1653,13 @@ function sendSpectatorEntry(connection, arena) {
   connection.send(Buffer.from([26, 0, ADDON_PROTOCOL_VERSION]));
   connection.send(occupiedSlotsPacket(arena));
   const focusSlot = connection.inGameSpectator ? connection.slot : [...arena.connections.keys()].sort((a, b) => a - b)[0] ?? 0;
-  connection.send(controlPacket(arena.world, focusSlot, null, true));
+  connection.send(controlPacket(arena.world, focusSlot, null));
   connection.send(Buffer.from([11, 8, 0]));
   connection.send(Buffer.from([11, 9, 0]));
-  connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now()), true));
+  connection.send(startPacket(arena.world, Math.max(0, arena.startsAt - Date.now())));
   connection.send(arenaStatsPacket(arena));
   if (arena.gameMode === "fast") connection.send(scoreSyncPacket(arena.world));
-  connection.send(statePacket(arena.world, true));
+  connection.send(statePacket(arena.world));
   connection.send(goalSpeedsPacket(arena));
   if (arena.phase === "ended") connection.send(gameOverPacket(arena.world));
 }

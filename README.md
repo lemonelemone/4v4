@@ -1,6 +1,12 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.29.0**
+Current release version: **3.31.0**
+
+Version 3.31.0 adds a saved **Disable miniplayer** checkbox directly underneath **Show in-game spectators**. When disabled, the personal post-match miniplayer stays closed and its local canvas recording is skipped. The miniplayer now has Play/Pause and selectable `0.5x`, `0.75x`, `1x`, `1.25x`, `1.5x` and `2x` playback speeds. Each displayed goal replay is capped at five seconds and begins at the latest kickoff when the goal was scored sooner, so kickoff goals never include footage from the previous play. Downloadable goal NCR clips remain up to ten seconds. Nothing was deployed.
+
+Version 3.30.0 fixes ordinary spectator rendering without either previous compromise. Empty slots remain at their real off-pitch parked coordinates, so they do not follow or collide with the ball; the existing renderer keeps them invisible. The userscript filters NitroClash's exported Focus Next control using an authoritative occupied-slot mask, skipping every empty slot in the same click. Real Edge testing confirmed no player trail at the ball, no visible parked players in the walls, and correct cycling between the ball and occupied players. The v3.29 replay/download/speed improvements remain. Nothing was deployed.
+
+Version 3.29.1 removes the v3.29.0 occupied-slot spectator rendering filter after real playtesting showed that it made the ball visibly lag. Spectator snapshots and rendering are restored to the previous behaviour, including the earlier cosmetic player trail, because smooth ball movement takes priority. The real local replay recording, Simple Replay option, prepared NCR downloads, top-left resizing, automatic kickoff cleanup and replay-viewer speed formula from v3.29.0 remain. Nothing was deployed.
 
 Version 3.29.0 fixes the ordinary-spectator player trail by explicitly identifying occupied slots while retaining safe Focus Next targets. The corner player now records the real NitroClash game canvas locally and uses that for Replay; Simple Replay remains the lightweight schematic view. Its resize grip is at the top-left, it closes and discards its recording at every new match/kickoff, and NCR files are prepared before the buttons enable so browser downloads are reliable. Goal speeds now use NitroClash and its replay viewer's exact `ceil(raw speed × 5)` calculation. Individual downloadable goal NCRs retain up to ten seconds. Nothing was deployed.
 
@@ -138,7 +144,7 @@ Every normal kickoff randomly selects four of the five official 5v5 spawn-pad pa
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.29.0** badge appears on the homepage.
+4. Confirm that the orange **HOSTED 4v4 v3.31.0** badge appears on the homepage.
 5. Choose normal hosted **4 vs 4** or the separate two-line **SUPER / NC** button, then choose **Amsterdam** (VPS) or **Frankfurt** (Render). Choose **1 VS 1**, **2 VS 2**, **3 VS 3**, **5 VS 5** or **Classic** for NitroClash's original servers. **Train** remains the original local training mode. Mode changes update the server list immediately, without refreshing.
 6. Click Play. The normal hosted mode, Fast mode and original modes remain separate.
 

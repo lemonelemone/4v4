@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.29.0
+// @version      3.31.0
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -45,6 +45,8 @@
   let goalPlayerClips = [];
   let goalPlayerMode = "replay";
   let goalPlayerSlideshow = false;
+  let goalPlayerPaused = false;
+  let goalPlayerPlaybackRate = 1;
   let goalPlayerClosed = false;
   let goalPlayerStartedAt = 0;
   let goalPlayerFrame = 0;
@@ -52,6 +54,8 @@
   let goalNcrCache = new Map();
   let goalNcrRequested = new Set();
   let occupiedSlotMask = 0;
+  let ordinarySpectatorWatching = false;
+  let spectatorFocusSlot = -1;
   let nativeReplayRecorder = null;
   let nativeReplayChunks = [];
   let nativeReplayUrl = "";
@@ -62,6 +66,31 @@
   let matchGoalSpeeds = [];
   let superMatchEnded = false;
   let superEndStatsVisible = true;
+  let miniplayerDisabled = false;
+  try { miniplayerDisabled = win.localStorage.getItem("nc4v4-miniplayer") === "off"; } catch (_) {}
+  function installSpectatorFocusFilter() {
+    const api = win.nitroclash;
+    const current = api?.replayControl;
+    if (typeof current !== "function" || current.__ncOccupiedFocusFilter) return;
+    const filtered = function (command, ...args) {
+      if (command !== 2 || !ordinarySpectatorWatching || !occupiedSlotMask)
+        return current.call(this, command, ...args);
+      let result, advanced = 0;
+      for (let steps = 0; steps <= 10; steps++) {
+        result = current.call(this, command, ...args);
+        advanced++;
+        // Native replayControl includes index 10 (an out-of-range ball view)
+        // before wrapping to -1. Skip that duplicate along with empty players.
+        spectatorFocusSlot = spectatorFocusSlot >= 10 ? -1 : spectatorFocusSlot + 1;
+        if (spectatorFocusSlot === -1 || (occupiedSlotMask & (1 << spectatorFocusSlot))) break;
+      }
+      filtered.__ncLastAdvanceCount = advanced;
+      return result;
+    };
+    filtered.__ncOccupiedFocusFilter = true;
+    filtered.__ncOriginal = current;
+    api.replayControl = filtered;
+  }
   function showReplayElement(element, visible, display = "block") {
     if (!element || element.dataset.ncReplayVisible === String(visible)) return;
     element.dataset.ncReplayVisible = String(visible);
@@ -88,7 +117,7 @@
   }
   function setGoalReelVisible(visible) {
     const player = document.getElementById("nc-goal-reel");
-    showReplayElement(player, Boolean(visible && !goalPlayerClosed && goalReelTotal));
+    showReplayElement(player, Boolean(visible && !miniplayerDisabled && !goalPlayerClosed && goalReelTotal));
   }
   function refreshSuperReplaySummary() {
     const player = document.getElementById("nc-goal-reel");
@@ -98,6 +127,8 @@
     player.querySelector("[data-nc-goal-detail]").textContent = goalReelDetails[goalReelCurrent] || "Loading replay…";
     player.querySelector("[data-nc-view-mode]").textContent = goalPlayerMode === "replay" ? "Simple replay" : "Replay";
     player.querySelector("[data-nc-slideshow]").textContent = goalPlayerSlideshow ? "Stop" : "Play all";
+    player.querySelector("[data-nc-play-pause]").textContent = goalPlayerPaused ? "Play" : "Pause";
+    player.querySelector("[data-nc-playback-speed]").value = String(goalPlayerPlaybackRate);
     player.querySelector("[data-nc-goal-prev]").disabled = goalReelTotal < 2;
     player.querySelector("[data-nc-goal-next]").disabled = goalReelTotal < 2;
     const goalReady = goalNcrCache.has(goalReelCurrent);
@@ -127,7 +158,7 @@
   function startNativeReplayCapture() {
     releaseNativeReplay();
     setTimeout(() => {
-      if (!hostedMatchActive || superMatchEnded || nativeReplayRecorder) return;
+      if (miniplayerDisabled || !hostedMatchActive || superMatchEnded || nativeReplayRecorder) return;
       const canvas = largestGameCanvas();
       if (!canvas?.captureStream || !win.MediaRecorder) return;
       try {
@@ -157,7 +188,8 @@
   function markNativeGoal() {
     if (!nativeReplayStartedAt) return;
     const end = Math.max(0, (performance.now() - nativeReplayStartedAt) / 1000);
-    nativeReplayRanges.push({ start: Math.max(nativeReplayKickoffAt, end - 6), end: end + .35 });
+    const replayEnd = end + .3;
+    nativeReplayRanges.push({ start: Math.max(nativeReplayKickoffAt, replayEnd - 5), end: replayEnd });
   }
   function stopNativeReplayCapture() {
     nativeReplayStopAt = performance.now();
@@ -165,7 +197,7 @@
   }
   function resetGoalPlayer() {
     cancelAnimationFrame(goalPlayerAnimation);
-    goalPlayerAnimation = 0; goalPlayerSlideshow = false; goalPlayerClosed = false;
+    goalPlayerAnimation = 0; goalPlayerSlideshow = false; goalPlayerPaused = false; goalPlayerClosed = false;
     goalPlayerClips = []; goalReelDetails = []; goalReelCurrent = 0; goalReelTotal = 0;
     goalNcrCache = new Map(); goalNcrRequested = new Set();
     releaseNativeReplay();
@@ -207,6 +239,7 @@
     if (!goalReelTotal) return;
     goalReelCurrent = (index + goalReelTotal) % goalReelTotal;
     goalPlayerSlideshow = slideshow;
+    goalPlayerPaused = false;
     goalPlayerStartedAt = performance.now(); goalPlayerFrame = 0;
     cancelAnimationFrame(goalPlayerAnimation);
     const canvas = document.getElementById("nc-goal-reel-canvas");
@@ -218,12 +251,13 @@
     if (useNative) {
       const finishNative = () => {
         if (!goalPlayerSlideshow || goalReelCurrent + 1 >= goalReelTotal) {
-          goalPlayerSlideshow = false; refreshSuperReplaySummary(); return;
+          goalPlayerSlideshow = false; goalPlayerPaused = true; refreshSuperReplaySummary(); return;
         }
         playGoal(goalReelCurrent + 1, true);
       };
       const begin = () => {
         video.currentTime = Math.min(nativeRange.start, Math.max(0, (video.duration || nativeRange.end) - .05));
+        video.playbackRate = goalPlayerPlaybackRate;
         video.play().catch(() => {});
         const watch = () => {
           if (goalPlayerClosed || !superMatchEnded) return video.pause();
@@ -239,14 +273,57 @@
     const animate = now => {
       const clip = goalPlayerClips[goalReelCurrent];
       if (!clip?.length || goalPlayerClosed || !superMatchEnded) return;
-      goalPlayerFrame = Math.min(clip.length - 1, Math.floor((now - goalPlayerStartedAt) * 60 / 1000));
+      if (goalPlayerPaused) return;
+      goalPlayerFrame = Math.min(clip.length - 1, Math.floor((now - goalPlayerStartedAt) * 60 * goalPlayerPlaybackRate / 1000));
       drawGoalPlayerFrame(clip[goalPlayerFrame]);
       if (goalPlayerFrame < clip.length - 1) goalPlayerAnimation = requestAnimationFrame(animate);
       else if (goalPlayerSlideshow && goalReelCurrent + 1 < goalReelTotal) playGoal(goalReelCurrent + 1, true);
-      else { goalPlayerSlideshow = false; refreshSuperReplaySummary(); }
+      else { goalPlayerSlideshow = false; goalPlayerPaused = true; refreshSuperReplaySummary(); }
     };
     refreshSuperReplaySummary();
     goalPlayerAnimation = requestAnimationFrame(animate);
+  }
+  function toggleGoalPlayerPlayback() {
+    const video = document.getElementById("nc-goal-reel-video");
+    goalPlayerPaused = !goalPlayerPaused;
+    if (goalPlayerPaused) {
+      cancelAnimationFrame(goalPlayerAnimation);
+      video?.pause();
+    } else if (goalPlayerMode === "replay" && nativeReplayUrl && nativeReplayRanges[goalReelCurrent]) {
+      const range = nativeReplayRanges[goalReelCurrent];
+      if (video.currentTime >= range.end - .03 || video.ended) video.currentTime = range.start;
+      video.playbackRate = goalPlayerPlaybackRate;
+      video.play().catch(() => {});
+      const watch = () => {
+        if (goalPlayerPaused || goalPlayerClosed || !superMatchEnded) return;
+        if (video.currentTime >= range.end || video.ended) { video.pause(); goalPlayerPaused = true; refreshSuperReplaySummary(); return; }
+        goalPlayerAnimation = requestAnimationFrame(watch);
+      };
+      goalPlayerAnimation = requestAnimationFrame(watch);
+    } else {
+      const clip = goalPlayerClips[goalReelCurrent];
+      if (clip?.length && goalPlayerFrame >= clip.length - 1) goalPlayerFrame = 0;
+      goalPlayerStartedAt = performance.now() - goalPlayerFrame * 1000 / (60 * goalPlayerPlaybackRate);
+      const animate = now => {
+        if (!clip?.length || goalPlayerPaused || goalPlayerClosed || !superMatchEnded) return;
+        goalPlayerFrame = Math.min(clip.length - 1, Math.floor((now - goalPlayerStartedAt) * 60 * goalPlayerPlaybackRate / 1000));
+        drawGoalPlayerFrame(clip[goalPlayerFrame]);
+        if (goalPlayerFrame < clip.length - 1) goalPlayerAnimation = requestAnimationFrame(animate);
+        else { goalPlayerPaused = true; refreshSuperReplaySummary(); }
+      };
+      goalPlayerAnimation = requestAnimationFrame(animate);
+    }
+    refreshSuperReplaySummary();
+  }
+  function setGoalPlayerPlaybackRate(rate) {
+    const next = Number(rate);
+    if (![0.5, 0.75, 1, 1.25, 1.5, 2].includes(next)) return;
+    goalPlayerPlaybackRate = next;
+    const video = document.getElementById("nc-goal-reel-video");
+    if (video) video.playbackRate = next;
+    if (!goalPlayerPaused && goalPlayerMode !== "replay")
+      goalPlayerStartedAt = performance.now() - goalPlayerFrame * 1000 / (60 * next);
+    refreshSuperReplaySummary();
   }
   function downloadGoalNcr(index) {
     const bytes = goalNcrCache.get(index);
@@ -729,6 +806,20 @@
       });
       label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Show in-game spectators";label.appendChild(caption);
       label.title="Only changes what you see. Spectator chat has its own setting.";home.appendChild(label);
+    }
+    if(home && !document.getElementById("nc-disable-miniplayer")) {
+      const label=document.createElement("label");
+      label.style.cssText="display:block;margin:8px;color:#f9a8d4;font:14px Arial";
+      const toggle=document.createElement("input");toggle.id="nc-disable-miniplayer";toggle.type="checkbox";
+      toggle.checked=miniplayerDisabled;
+      toggle.addEventListener("change",()=>{
+        miniplayerDisabled=toggle.checked;
+        try{win.localStorage.setItem("nc4v4-miniplayer",miniplayerDisabled ? "off" : "on");}catch(_){}
+        if(miniplayerDisabled){goalPlayerClosed=true;cancelAnimationFrame(goalPlayerAnimation);releaseNativeReplay();setGoalReelVisible(false);}
+        else {goalPlayerClosed=false;if(hostedMatchActive&&!superMatchEnded)startNativeReplayCapture();setGoalReelVisible(superMatchEnded);}
+      });
+      label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Disable miniplayer";label.appendChild(caption);
+      label.title="Stops the personal goal player and its local game recording.";home.appendChild(label);
     }
     const chat=document.getElementById("chat-block");
     if(!chat || document.getElementById("nc-spectator-chat-status"))return;
@@ -1252,6 +1343,8 @@
       spectatorChatSocket = socket;
       observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
       spectatorChatWatching = spectatorSocket;
+      ordinarySpectatorWatching = spectatorSocket && !inGameSpectatorSocket;
+      occupiedSlotMask = 0; spectatorFocusSlot = -1;
       spectatorChatSupported = false;
       chatRows=[];clearTimeout(chatFadeTimer);
       let playerJoinSent = false;
@@ -1364,7 +1457,7 @@
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
             if (bytes[1] === 0) {
-              setServerVersionWarning(bytes[2] !== 29);
+              setServerVersionWarning(bytes[2] !== 32);
               receiveSpectatorChat(bytes);
               return;
             }
@@ -1449,6 +1542,7 @@
           if(bytes?.[0]===7) {
             if(spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));
             observerSlot=bytes[2];
+            if (ordinarySpectatorWatching && bytes[1] === 1) spectatorFocusSlot = bytes[2];
             chatRows=[];clearTimeout(chatFadeTimer);
             installObserverSensors();
             const capture={index:0,observer:inGameSpectatorSocket};controlBodyCapture=capture;
@@ -1468,6 +1562,7 @@
         if (spectatorChatSocket === socket) {
           observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);
           spectatorChatSocket = null;joinOffer=null;refreshJoinButton();
+          ordinarySpectatorWatching=false;occupiedSlotMask=0;spectatorFocusSlot=-1;
           spectatorChatSupported = false;
           refreshSpectatorChat();
         }
@@ -1572,8 +1667,7 @@
               if(observerMovement && playerIndex===observerSlot)observerSprite=child;
               playerIndex++;
               const outsideArena = position.x < -20 || position.x > 120 || position.y < -20 || position.y > 80;
-              const occupied = Boolean(occupiedSlotMask & (1 << (playerIndex - 1)));
-              if (outsideArena || !occupied) {
+              if (outsideArena) {
                 hideForThisFrame(child);
               // The closed client constructs the scene in exact pairs:
               // player[slot], marker[slot], player[slot + 1], marker[slot + 1].
@@ -1872,6 +1966,7 @@
         panel.appendChild(button);
     };
     const relabel = () => {
+      installSpectatorFocusFilter();
       refreshMeasuredPings();
       installSpectatorChat();
       refreshSpectatorChat();refreshJoinButton();
@@ -2026,7 +2121,8 @@
         <video id="nc-goal-reel-video" muted playsinline aria-label="Personal native goal replay" style="display:none;width:100%;height:calc(100% - 91px);object-fit:cover;background:#000;cursor:move"></video>
         <canvas id="nc-goal-reel-canvas" width="640" height="360" aria-label="Personal simple goal replay" style="display:block;width:100%;height:calc(100% - 91px);background:#355f29;cursor:move"></canvas>
         <div style="height:60px;box-sizing:border-box;display:flex;align-content:center;justify-content:center;gap:4px;flex-wrap:wrap;padding:5px;background:rgba(12,14,20,.98)">
-          <button data-nc-goal-prev type="button" title="Previous goal">◀</button><button data-nc-slideshow type="button">Play all</button><button data-nc-goal-next type="button" title="Next goal">▶</button>
+          <button data-nc-goal-prev type="button" title="Previous goal">◀</button><button data-nc-play-pause type="button">Pause</button><button data-nc-slideshow type="button">Play all</button><button data-nc-goal-next type="button" title="Next goal">▶</button>
+          <label style="display:inline-flex;align-items:center;gap:2px;font:700 10px Arial">Speed <select data-nc-playback-speed aria-label="Replay speed" style="height:23px;border:1px solid rgba(255,255,255,.5);border-radius:5px;background:#f5f5f5;color:#252033;font:700 10px Arial"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
           <button data-nc-view-mode type="button">Simple replay</button><button data-nc-download-goal type="button">Goal NCR</button><button data-nc-download-all type="button">All NCR</button>
         </div>
         <div data-nc-goal-resize title="Drag to resize" style="position:absolute;left:0;top:0;z-index:2;width:17px;height:17px;cursor:nwse-resize;background:linear-gradient(135deg,rgba(255,255,255,.9) 18%,transparent 21%,transparent 32%,rgba(255,255,255,.9) 35%,rgba(255,255,255,.9) 43%,transparent 46%)"></div>`;
@@ -2034,7 +2130,7 @@
         button.style.cssText = "padding:4px 7px;border:1px solid rgba(255,255,255,.5);border-radius:5px;background:#f5f5f5;color:#252033;font:700 10px Arial;cursor:pointer";
       document.body.appendChild(reel);
       reel.querySelector("[data-nc-goal-close]").addEventListener("click", () => {
-        goalPlayerClosed = true; goalPlayerSlideshow = false; cancelAnimationFrame(goalPlayerAnimation); setGoalReelVisible(false);
+        goalPlayerClosed = true; goalPlayerSlideshow = false; goalPlayerPaused = true; cancelAnimationFrame(goalPlayerAnimation);reel.querySelector("video")?.pause();setGoalReelVisible(false);
       });
       reel.querySelector("[data-nc-goal-prev]").addEventListener("click", () => playGoal(goalReelCurrent - 1));
       reel.querySelector("[data-nc-goal-next]").addEventListener("click", () => playGoal(goalReelCurrent + 1));
@@ -2042,6 +2138,8 @@
         if (goalPlayerSlideshow) { goalPlayerSlideshow = false; refreshSuperReplaySummary(); }
         else playGoal(0, true);
       });
+      reel.querySelector("[data-nc-play-pause]").addEventListener("click", toggleGoalPlayerPlayback);
+      reel.querySelector("[data-nc-playback-speed]").addEventListener("change", event => setGoalPlayerPlaybackRate(event.target.value));
       reel.querySelector("[data-nc-view-mode]").addEventListener("click", () => {
         goalPlayerMode = goalPlayerMode === "replay" ? "simple" : "replay";
         playGoal(goalReelCurrent, goalPlayerSlideshow); refreshSuperReplaySummary();
@@ -2092,14 +2190,14 @@
     if (!document.getElementById("nc-server-version-warning")) {
       const warning = document.createElement("div");
       warning.id = "nc-server-version-warning";
-      warning.textContent = "Server is older than v3.29.0 — restart it from the new local folder to enable corrected replays, speeds and spectator rendering.";
+      warning.textContent = "Server is older than v3.31.0 — restart it from the new local folder to enable five-second replay clips and current spectator/replay fixes.";
       warning.style.cssText = "display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:1000001;max-width:min(620px,calc(100vw - 24px));box-sizing:border-box;padding:8px 12px;border:2px solid #ffd0d8;border-radius:8px;background:#b91c3c;color:#fff;font:bold 12px Arial;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.45)";
       document.body.appendChild(warning);
     }
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.29.0";
+    badge.textContent = "HOSTED 4v4 v3.31.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
