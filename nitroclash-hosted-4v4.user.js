@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.31.0
+// @version      3.31.1
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -66,8 +66,8 @@
   let matchGoalSpeeds = [];
   let superMatchEnded = false;
   let superEndStatsVisible = true;
-  let miniplayerDisabled = false;
-  try { miniplayerDisabled = win.localStorage.getItem("nc4v4-miniplayer") === "off"; } catch (_) {}
+  let miniplayerDisabled = true;
+  try { miniplayerDisabled = win.localStorage.getItem("nc4v4-miniplayer") !== "on"; } catch (_) {}
   function installSpectatorFocusFilter() {
     const api = win.nitroclash;
     const current = api?.replayControl;
@@ -807,18 +807,18 @@
       label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Show in-game spectators";label.appendChild(caption);
       label.title="Only changes what you see. Spectator chat has its own setting.";home.appendChild(label);
     }
-    if(home && !document.getElementById("nc-disable-miniplayer")) {
+    if(home && !document.getElementById("nc-enable-miniplayer")) {
       const label=document.createElement("label");
       label.style.cssText="display:block;margin:8px;color:#f9a8d4;font:14px Arial";
-      const toggle=document.createElement("input");toggle.id="nc-disable-miniplayer";toggle.type="checkbox";
-      toggle.checked=miniplayerDisabled;
+      const toggle=document.createElement("input");toggle.id="nc-enable-miniplayer";toggle.type="checkbox";
+      toggle.checked=!miniplayerDisabled;
       toggle.addEventListener("change",()=>{
-        miniplayerDisabled=toggle.checked;
+        miniplayerDisabled=!toggle.checked;
         try{win.localStorage.setItem("nc4v4-miniplayer",miniplayerDisabled ? "off" : "on");}catch(_){}
         if(miniplayerDisabled){goalPlayerClosed=true;cancelAnimationFrame(goalPlayerAnimation);releaseNativeReplay();setGoalReelVisible(false);}
         else {goalPlayerClosed=false;if(hostedMatchActive&&!superMatchEnded)startNativeReplayCapture();setGoalReelVisible(superMatchEnded);}
       });
-      label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Disable miniplayer";label.appendChild(caption);
+      label.appendChild(toggle);const caption=document.createElement("span");caption.textContent=" Enable Miniplayer (may cause lag)";label.appendChild(caption);
       label.title="Stops the personal goal player and its local game recording.";home.appendChild(label);
     }
     const chat=document.getElementById("chat-block");
@@ -2197,7 +2197,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.31.0";
+    badge.textContent = "HOSTED 4v4 v3.31.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
