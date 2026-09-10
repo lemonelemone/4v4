@@ -1,6 +1,8 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.32.0**
+Current release version: **3.32.1**
+
+Version 3.32.1 fixes the team-chat label staying in the normal T/Enter chat box after team chat had been opened. Y still shows **TEAM CHAT**, while normal chat restores its original blank label. This userscript-only fix uses the existing v3.32.0 server protocol, so the server does not need restarting.
 
 Version 3.32.0 adds private **Y team chat** without adding or exposing any new gameplay mode. In normal hosted 4v4 and SUPER NC, the server authoritatively delivers messages only to connected players on the sender's blue or red team. The same control also works in linked/party games on NitroClash's original 1v1, 2v2, 3v3, 5v5 and Classic modes through a separate lightweight party-code relay; random/non-party original matches remain unsupported because they do not expose a reliable shared match identifier. Team messages use the normal in-game chat box and history and appear as **Name [Team]:** in blue for Team 1 or red for Team 2. Spectators do not receive them and retain purple spectator chat. The feature is event-driven with no per-frame scene scan. This release requires both the v3.32.0 server and userscript; nothing was deployed.
 
@@ -146,7 +148,7 @@ Every normal kickoff randomly selects four of the five official 5v5 spawn-pad pa
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.32.0** badge appears on the homepage.
+4. Confirm that the orange **HOSTED 4v4 v3.32.1** badge appears on the homepage.
 5. Choose normal hosted **4 vs 4** or the separate two-line **SUPER / NC** button, then choose **Amsterdam** (VPS) or **Frankfurt** (Render). Choose **1 VS 1**, **2 VS 2**, **3 VS 3**, **5 VS 5** or **Classic** for NitroClash's original servers. **Train** remains the original local training mode. Mode changes update the server list immediately, without refreshing.
 6. Click Play. The normal hosted mode, Fast mode and original modes remain separate.
 

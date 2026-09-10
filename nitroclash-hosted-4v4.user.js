@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.32.0
+// @version      3.32.1
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -600,7 +600,7 @@
   function setChatAudience(audience, input=document.getElementById("chat-input")) {
     chatAudience = audience === "team" ? "team" : "all";
     if(input) {
-      if(!input.dataset.ncDefaultPlaceholder) input.dataset.ncDefaultPlaceholder=input.placeholder || "";
+      if(!Object.prototype.hasOwnProperty.call(input.dataset,"ncDefaultPlaceholder")) input.dataset.ncDefaultPlaceholder=input.placeholder || "";
       input.placeholder=chatAudience === "team" ? "TEAM CHAT" : input.dataset.ncDefaultPlaceholder;
     }
     const status=document.getElementById("nc-spectator-chat-status");
@@ -2289,7 +2289,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.32.0";
+    badge.textContent = "HOSTED 4v4 v3.32.1";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
