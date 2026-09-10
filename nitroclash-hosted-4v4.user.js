@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.31.1
+// @version      3.32.0
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -586,6 +586,8 @@
     }
   }
   let spectatorChatSocket = null;
+  let teamChatSocket = null;
+  let officialPartyGameSocket = null;
   let spectatorChatSupported = false;
   let spectatorChatWatching = false;
   let observerMovement = false;
@@ -593,9 +595,28 @@
   let observerKeys = 0;
   let controlBodyCapture = null;
   let chatPending = false;
+  let chatAudience = "all";
+  let localPlayerTeam = null;
+  function setChatAudience(audience, input=document.getElementById("chat-input")) {
+    chatAudience = audience === "team" ? "team" : "all";
+    if(input) {
+      if(!input.dataset.ncDefaultPlaceholder) input.dataset.ncDefaultPlaceholder=input.placeholder || "";
+      input.placeholder=chatAudience === "team" ? "TEAM CHAT" : input.dataset.ncDefaultPlaceholder;
+    }
+    const status=document.getElementById("nc-spectator-chat-status");
+    if(status && !spectatorChatWatching) {
+      status.style.display=chatAudience === "team" ? "block" : "none";
+      if(chatAudience === "team") {
+        const side=localPlayerTeam === 0 ? "Blue" : localPlayerTeam === 1 ? "Red" : "your team";
+        status.textContent=`Team chat · ${side} only`;
+        status.style.color=localPlayerTeam === 1 ? "#ff3864" : "#35c7ef";
+      }
+    }
+  }
   function closeMatchChat(){
     const input=document.getElementById("chat-input");
     if(input){input.value="";input.blur();input.disabled=true;input.style.display="none";}
+    setChatAudience("all",input);
   }
   let consumedChatKey = null;
   let chatRows = [];
@@ -649,11 +670,16 @@
   function sendMatchChat(text) {
     if(spectatorChatWatching){sendSpectatorMessage(text);return;}
     const message=String(text).trim().slice(0,255);
-    if(message && spectatorChatSocket?.readyState===1) {
-      const packet=new Uint8Array(2+message.length*2),view=new DataView(packet.buffer);
-      packet[0]=4;packet[1]=message.length;
-      for(let i=0;i<message.length;i++)view.setUint16(2+i*2,message.charCodeAt(i));
-      spectatorChatSocket.send(packet);
+    const outgoingSocket=chatAudience === "team" ? teamChatSocket : spectatorChatSocket;
+    if(message && outgoingSocket?.readyState===1) {
+      const teamOnly=chatAudience === "team";
+      const packet=new Uint8Array((teamOnly ? 3 : 2)+message.length*2),view=new DataView(packet.buffer);
+      packet[0]=teamOnly ? 26 : 4;
+      packet[1]=teamOnly ? 20 : message.length;
+      if(teamOnly)packet[2]=message.length;
+      const offset=teamOnly ? 3 : 2;
+      for(let i=0;i<message.length;i++)view.setUint16(offset+i*2,message.charCodeAt(i));
+      outgoingSocket.send(packet);
     }
     closeMatchChat();
   }
@@ -679,10 +705,10 @@
       if(type==="keyup")consumedChatKey=null;
       return;
     }
-    if(spectatorChatSocket?.readyState===1) {
+    if(spectatorChatSocket?.readyState===1 || teamChatSocket?.readyState===1) {
       const input=document.getElementById("chat-input");
       const typing=/^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName || "") || event.target?.isContentEditable;
-      if(event.target===input || document.activeElement===input) {
+      if((chatAudience==="team" || spectatorChatSocket?.readyState===1) && (event.target===input || document.activeElement===input)) {
         event.stopImmediatePropagation();
         if(event.key==="Tab")event.preventDefault();
         if(event.key==="Enter") {
@@ -704,17 +730,20 @@
         }
         return;
       }
-      const chatOpenKey=event.key?.toLowerCase()==="t" || event.key==="Enter";
+      const teamChatOpenKey=!spectatorChatWatching && teamChatSocket?.readyState===1 && event.key?.toLowerCase()==="y";
+      const hostedChatOpenKey=spectatorChatSocket?.readyState===1 && (event.key?.toLowerCase()==="t" || event.key==="Enter");
+      const chatOpenKey=hostedChatOpenKey || teamChatOpenKey;
       if(!typing && chatOpenKey) {
         event.preventDefault();event.stopImmediatePropagation();
         if(type==="keyup" && input) {
+          setChatAudience(teamChatOpenKey ? "team" : "all",input);
           input.disabled=false;input.readOnly=false;input.style.display="";
           const block=document.getElementById("chat-block");if(block)block.style.display="block";
           input.focus();
           const history=document.getElementById("chat-history");
           if(history){history.style.display="block";history.style.opacity="1";}
-          if(!spectatorChatEnabled)setChatStatus("Spectator chat is off. Enable it on the homepage.");
-          else if(!spectatorChatSupported)setChatStatus("Spectator chat needs the updated server.");
+          if(spectatorChatWatching && !spectatorChatEnabled)setChatStatus("Spectator chat is off. Enable it on the homepage.");
+          else if(spectatorChatWatching && !spectatorChatSupported)setChatStatus("Spectator chat needs the updated server.");
         }
         return;
       }
@@ -764,7 +793,10 @@
   }
   function refreshSpectatorChat() {
     const status=document.getElementById("nc-spectator-chat-status");
-    if(status)status.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 ? "block" : "none";
+    if(status){
+      status.style.display=spectatorChatWatching && spectatorChatSocket?.readyState===1 ? "block" : "none";
+      if(spectatorChatWatching)status.style.color="#a7f3d0";
+    }
   }
 
   function subscribeSpectatorChat() {
@@ -843,8 +875,10 @@
       subscribeSpectatorChat();
       return;
     }
-    if (bytes[1] !== 1 || !spectatorChatEnabled) return;
-    let offset = 2;
+    const teamMessage=bytes[1] === 20;
+    if (!teamMessage && (bytes[1] !== 1 || !spectatorChatEnabled)) return;
+    const team=teamMessage ? bytes[2] : null;
+    let offset = teamMessage ? 3 : 2;
     const read = () => {
       const length = bytes[offset++];
       if (length === undefined || offset + length * 2 > bytes.length) throw new Error("Invalid chat packet");
@@ -853,12 +887,12 @@
       return value;
     };
     const name = read(), message = read();
-    if(name===String(document.getElementById("username")?.value || "").slice(0,12))confirmSpectatorMessage();
+    if(!teamMessage && name===String(document.getElementById("username")?.value || "").slice(0,12))confirmSpectatorMessage();
 
     const row = document.createElement("div"), label = document.createElement("strong"), body = document.createElement("span");
-    row.className="nc-spectator-message";
-    label.style.color = "#8b46bb";
-    label.textContent = name + " [Spectator]: ";
+    row.className=teamMessage ? "nc-team-message" : "nc-spectator-message";
+    label.style.color = teamMessage ? (team === 1 ? "#ff3864" : "#35c7ef") : "#8b46bb";
+    label.textContent = name + (teamMessage ? " [Team]: " : " [Spectator]: ");
     body.textContent = message;
     row.appendChild(label); row.appendChild(body); appendMatchChat(row);
   }
@@ -1203,6 +1237,7 @@
           rosterRoute = /^[A-HJ-NP-Z0-9]{6}$/.test(code) ? {
             partyCode: code,
             team: ownTeam===0 || ownTeam===1 ? ownTeam : null,
+            name: name.slice(0, 12),
           } : null;
           const revision = ++generation;
           if (offset + 3 < bytes.length) {
@@ -1240,7 +1275,7 @@
           }
         } else if (bytes?.[0] === 3) {
           // This listener runs before the stock client clears the party hash.
-          pendingPartyRoute = hostedMode ? (rosterRoute || currentPrivatePartyRoute()) : null;
+          pendingPartyRoute = rosterRoute || currentPrivatePartyRoute();
           pendingPartyServer = hostedMode ? (partyRegion || selectedServerCode()) : null;
         }
       } catch (error) { console.warn("[nc4v4] Invalid party update", error); }
@@ -1261,7 +1296,54 @@
     const inTeam1 = listHasPlayer("teammates-list");
     const inTeam2 = listHasPlayer("teammates-list-2");
     const team = inTeam1 !== inTeam2 ? (inTeam1 ? 0 : 1) : null;
-    return { partyCode, team };
+    return { partyCode, team, name: username.slice(0, 12) };
+  }
+
+  function trackOfficialPartyGameSocket(socket, route) {
+    officialPartyGameSocket=socket;
+    let relayStarted=false;
+    const closeRelay=()=>{
+      if(officialPartyGameSocket===socket)officialPartyGameSocket=null;
+      const relay=teamChatSocket;
+      if(relay?.__ncOfficialPartyGame===socket){teamChatSocket=null;try{relay.close();}catch(_){} }
+      setChatAudience("all");
+    };
+    socket.addEventListener("message",event=>{
+      try {
+        const bytes=event.data instanceof ArrayBuffer ? new Uint8Array(event.data) :
+          ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer,event.data.byteOffset,event.data.byteLength) : null;
+        if(bytes?.[0]===7 && !relayStarted) {
+          relayStarted=true;
+          localPlayerTeam=bytes[2] % 2;
+          const name=String(route.name || document.getElementById("username")?.value || "Player").trim().slice(0,12) || "Player";
+          const relayUrl=`${serverChoices[defaultServerCode].url}/?partyChat=1&party=${encodeURIComponent(route.partyCode)}&team=${localPlayerTeam}&name=${encodeURIComponent(name)}`;
+          const relay=new NativeWebSocket(relayUrl);
+          relay.binaryType="arraybuffer";
+          relay.__ncOfficialPartyGame=socket;
+          teamChatSocket=relay;
+          relay.addEventListener("message",relayEvent=>{
+            try {
+              const packet=relayEvent.data instanceof ArrayBuffer ? new Uint8Array(relayEvent.data) :
+                ArrayBuffer.isView(relayEvent.data) ? new Uint8Array(relayEvent.data.buffer,relayEvent.data.byteOffset,relayEvent.data.byteLength) : null;
+              if(packet?.[0]!==26)return;
+              if(packet[1]===0){setServerVersionWarning(packet[2]!==33);return;}
+              if(packet[1]===20)receiveSpectatorChat(packet);
+            } catch (_) {}
+          });
+          relay.addEventListener("close",()=>{if(teamChatSocket===relay)teamChatSocket=null;});
+        }
+        if(bytes?.[0]===13) {
+          const previousChat=document.getElementById("chat-history")?.innerHTML;
+          setTimeout(()=>{
+            if(officialPartyGameSocket!==socket || document.getElementById("chat-history")?.innerHTML===previousChat)return;
+            const row=document.getElementById("chat-history")?.lastElementChild;
+            if(row && !row.classList.contains("nc-team-message"))appendMatchChat(row);
+          });
+        }
+      } catch (_) {}
+    });
+    socket.addEventListener("close",closeRelay);
+    return socket;
   }
 
   function LocalWebSocket(url, protocols) {
@@ -1273,7 +1355,13 @@
     const hostedAlias = serverCodeForSocketUrl(text);
     // Official play, spectate and latency sockets keep their original URLs.
     if (!hostedAlias && !pendingPartyServer) {
-      return protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+      const socket=protocols === undefined ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+      const route=isNitroSocket ? (pendingPartyRoute || currentPrivatePartyRoute()) : null;
+      if(route?.partyCode){
+        pendingPartyRoute=null;
+        return trackOfficialPartyGameSocket(socket,route);
+      }
+      return socket;
     }
     const pagePrivateRoute = isNitroSocket ? (pendingPartyRoute ||
       (pendingGameSocketIntent ? currentPrivatePartyRoute() : null)) : null;
@@ -1341,7 +1429,9 @@
       refreshSuperScoreboard();
       joinOffer=null;
       spectatorChatSocket = socket;
+      teamChatSocket = socket;
       observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);setChatStatus("");
+      localPlayerTeam=null;setChatAudience("all");
       spectatorChatWatching = spectatorSocket;
       ordinarySpectatorWatching = spectatorSocket && !inGameSpectatorSocket;
       occupiedSlotMask = 0; spectatorFocusSlot = -1;
@@ -1457,7 +1547,7 @@
           if (bytes?.[0] === 26) {
             event.stopImmediatePropagation?.();
             if (bytes[1] === 0) {
-              setServerVersionWarning(bytes[2] !== 32);
+              setServerVersionWarning(bytes[2] !== 33);
               receiveSpectatorChat(bytes);
               return;
             }
@@ -1542,6 +1632,7 @@
           if(bytes?.[0]===7) {
             if(spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));
             observerSlot=bytes[2];
+            if(!spectatorSocket)localPlayerTeam=bytes[2] % 2;
             if (ordinarySpectatorWatching && bytes[1] === 1) spectatorFocusSlot = bytes[2];
             chatRows=[];clearTimeout(chatFadeTimer);
             installObserverSensors();
@@ -1562,6 +1653,7 @@
         if (spectatorChatSocket === socket) {
           observerMovement=false;observerKeys=0;observerPointer=null;observerSprite=null;observerMouseSupported=false;chatPending=false;clearTimeout(chatConfirmTimer);
           spectatorChatSocket = null;joinOffer=null;refreshJoinButton();
+          if(teamChatSocket===socket)teamChatSocket=null;
           ordinarySpectatorWatching=false;occupiedSlotMask=0;spectatorFocusSlot=-1;
           spectatorChatSupported = false;
           refreshSpectatorChat();
@@ -2190,14 +2282,14 @@
     if (!document.getElementById("nc-server-version-warning")) {
       const warning = document.createElement("div");
       warning.id = "nc-server-version-warning";
-      warning.textContent = "Server is older than v3.31.0 — restart it from the new local folder to enable five-second replay clips and current spectator/replay fixes.";
+      warning.textContent = "Server is older than v3.32.0 — update it before using team chat.";
       warning.style.cssText = "display:none;position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:1000001;max-width:min(620px,calc(100vw - 24px));box-sizing:border-box;padding:8px 12px;border:2px solid #ffd0d8;border-radius:8px;background:#b91c3c;color:#fff;font:bold 12px Arial;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.45)";
       document.body.appendChild(warning);
     }
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.31.1";
+    badge.textContent = "HOSTED 4v4 v3.32.0";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",

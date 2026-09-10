@@ -22,7 +22,7 @@ const REGULATION_TICKS = MATCH_SECONDS * PHYSICS_HZ;
 const POSTGAME_MS = Number(process.env.NC_POSTGAME_MS || 30_000);
 const RECONNECT_TTL_MS = Number(process.env.NC_RECONNECT_TTL_MS || 60_000);
 const DEFAULT_IDLE_TIMEOUT_MS = 20_000;
-const ADDON_PROTOCOL_VERSION = 32;
+const ADDON_PROTOCOL_VERSION = 33;
 const CLIENT_SLOTS = 10; // Use the stock 5v5 layout.
 const ALL_PLAYER_SLOTS = Object.freeze(Array.from({ length: CLIENT_SLOTS }, (_, slot) => slot));
 const PLAYER_RADIUS = 0.6103515625;
@@ -448,6 +448,18 @@ function chatPacket(slot, message) {
   buffer[0] = 13;
   buffer[1] = slot;
   putString(buffer, 2, text);
+  return buffer;
+}
+
+function teamChatPacket(team, name, message) {
+  const playerName = String(name || "").slice(0, 12);
+  const text = String(message || "").slice(0, 255);
+  const buffer = Buffer.alloc(5 + playerName.length * 2 + text.length * 2);
+  buffer[0] = 26;
+  buffer[1] = 20;
+  buffer[2] = team;
+  const offset = putString(buffer, 3, playerName);
+  putString(buffer, offset, text);
   return buffer;
 }
 
@@ -897,6 +909,7 @@ function simulate(world) {
 // when an individual socket disconnects.
 const arenas = new Map();
 const privateArenas = new Map();
+const officialPartyChatRooms = new Map();
 const activeReservations = new Map();
 const activeQuickJoinTokens = new Map();
 let nextArenaId = 1;
@@ -1857,6 +1870,23 @@ function handleSpectatorChat(connection, packet) {
   }
 }
 
+function handleTeamChat(connection, packet) {
+  if (!connection.ready || !connection.arena || connection.spectator || connection.slot === null) return;
+  if (packet.length < 3 || packet.length !== 3 + 2 * packet[2]) return;
+  const now = Date.now();
+  if (now - connection.lastChatAt < 350) return;
+  const message = readString(packet, 2).value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 255);
+  if (!message) return;
+  const team = connection.slot % 2;
+  const outgoing = teamChatPacket(team, connection.username, message);
+  connection.lastChatAt = now;
+  connection.lastActivityAt = now;
+  for (const recipient of connection.arena.connections.values()) {
+    if (recipient.ready && !recipient.cleaned && recipient.slot !== null && recipient.slot % 2 === team)
+      recipient.send(outgoing);
+  }
+}
+
 function onlinePlayerCount(gameMode = null) {
   let count=0;
   for(const arena of arenas.values())if(!gameMode || arena.gameMode===gameMode)for(const c of arena.connections.values())if(c.ready && !c.cleaned)count++;
@@ -1941,6 +1971,50 @@ function installSharedUpgradeHandler(serverInstance) {
       `Sec-WebSocket-Accept: ${accept}`, "\r\n",
     ].join("\r\n"));
 
+    const partyChatRelay = upgradeUrl.searchParams.get("partyChat") === "1" &&
+      /^[A-HJ-NP-Z0-9]{6}$/.test(requestedParty) && requestedTeam !== null;
+    if (partyChatRelay) {
+      const username = String(upgradeUrl.searchParams.get("name") || "Player")
+        .replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 12) || "Player";
+      const room = officialPartyChatRooms.get(requestedParty) || new Set();
+      officialPartyChatRooms.set(requestedParty, room);
+      const relay = {
+        pending: Buffer.alloc(0), team: requestedTeam, username, lastChatAt: 0, cleaned: false,
+        send(payload, opcode = 2) { if (socket.writable) socket.write(wsFrame(payload, opcode)); },
+      };
+      room.add(relay);
+      const cleanup = () => {
+        if (relay.cleaned) return;
+        relay.cleaned = true;
+        room.delete(relay);
+        if (!room.size) officialPartyChatRooms.delete(requestedParty);
+      };
+      relay.send(Buffer.from([26, 0, ADDON_PROTOCOL_VERSION]));
+      socket.on("data", (chunk) => {
+        try {
+          for (const frame of readFrames(relay, chunk)) {
+            if (relay.cleaned) return;
+            if (frame.opcode === 8) { cleanup(); socket.end(wsFrame(Buffer.alloc(0), 8)); return; }
+            if (frame.opcode === 9) { relay.send(frame.payload, 10); continue; }
+            if (frame.opcode !== 2 || frame.payload.length < 3) continue;
+            const packet = frame.payload;
+            if (packet[0] !== 26 || packet[1] !== 20 || packet.length !== 3 + 2 * packet[2]) continue;
+            const now = Date.now();
+            if (now - relay.lastChatAt < 350) continue;
+            const message = readString(packet, 2).value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 255);
+            if (!message) continue;
+            relay.lastChatAt = now;
+            const outgoing = teamChatPacket(relay.team, relay.username, message);
+            for (const recipient of room)
+              if (!recipient.cleaned && recipient.team === relay.team) recipient.send(outgoing);
+          }
+        } catch (_) { cleanup(); socket.destroy(); }
+      });
+      socket.on("close", cleanup);
+      socket.on("error", cleanup);
+      return;
+    }
+
     const connection = {
       socket,
       pending: Buffer.alloc(0),
@@ -1991,6 +2065,10 @@ function installSharedUpgradeHandler(serverInstance) {
         const packet = frame.payload;
         switch (packet[0]) {
           case 26:
+            if (packet[1] === 20) {
+              handleTeamChat(connection, packet);
+              break;
+            }
             if (packet[1] === 2 && connection.inGameSpectator) {
               connection.send(Buffer.from([26, 2, 2])); // Ghost movement supported.
               break;

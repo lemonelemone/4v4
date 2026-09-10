@@ -1,6 +1,8 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.31.0**
+Current release version: **3.32.0**
+
+Version 3.32.0 adds private **Y team chat** without adding or exposing any new gameplay mode. In normal hosted 4v4 and SUPER NC, the server authoritatively delivers messages only to connected players on the sender's blue or red team. The same control also works in linked/party games on NitroClash's original 1v1, 2v2, 3v3, 5v5 and Classic modes through a separate lightweight party-code relay; random/non-party original matches remain unsupported because they do not expose a reliable shared match identifier. Team messages use the normal in-game chat box and history and appear as **Name [Team]:** in blue for Team 1 or red for Team 2. Spectators do not receive them and retain purple spectator chat. The feature is event-driven with no per-frame scene scan. This release requires both the v3.32.0 server and userscript; nothing was deployed.
 
 Version 3.31.0 adds a saved **Disable miniplayer** checkbox directly underneath **Show in-game spectators**. When disabled, the personal post-match miniplayer stays closed and its local canvas recording is skipped. The miniplayer now has Play/Pause and selectable `0.5x`, `0.75x`, `1x`, `1.25x`, `1.5x` and `2x` playback speeds. Each displayed goal replay is capped at five seconds and begins at the latest kickoff when the goal was scored sooner, so kickoff goals never include footage from the previous play. Downloadable goal NCR clips remain up to ten seconds. Nothing was deployed.
 
@@ -144,11 +146,13 @@ Every normal kickoff randomly selects four of the five official 5v5 spawn-pad pa
 1. Disable the other **NitroClash — Custom Server** userscript so the two redirectors do not conflict.
 2. In Tampermonkey, create a new script and replace its contents with `nitroclash-hosted-4v4.user.js`, then save it.
 3. Reload `https://nitroclash.io`.
-4. Confirm that the orange **HOSTED 4v4 v3.31.0** badge appears on the homepage.
+4. Confirm that the orange **HOSTED 4v4 v3.32.0** badge appears on the homepage.
 5. Choose normal hosted **4 vs 4** or the separate two-line **SUPER / NC** button, then choose **Amsterdam** (VPS) or **Frankfurt** (Render). Choose **1 VS 1**, **2 VS 2**, **3 VS 3**, **5 VS 5** or **Classic** for NitroClash's original servers. **Train** remains the original local training mode. Mode changes update the server list immediately, without refreshing.
 6. Click Play. The normal hosted mode, Fast mode and original modes remain separate.
 
 For a multiplayer check, open NitroClash independently in a second tab or browser window with the hosted userscript, choose 4v4 and press Play. Each tab keeps a distinct player identity, while refreshing a tab retains its reconnect identity.
+
+During a supported match, press **T** or **Enter** for normal chat, or press **Y** for private team chat. Team 1 labels are blue and Team 2 labels are red. Y team chat works in normal hosted 4v4, SUPER NC, and linked/party games using NitroClash's original modes; random original matches retain only NitroClash's normal chat.
 
 For linked games, everyone should install **v3.18.0 or later** to use Fast mode. Create/join a party and let the host choose normal/Fast mode and server. Members follow the host's live selection without refreshing and cannot override it. In either hosted 4v4 mode, all members press Play to mark themselves ready; the match starts when everyone is ready. Arrange Team 1/Team 2: **Team 1 is blue; Team 2 is red**. Hosted linked parties are isolated by party code even when **Private game** is not ticked. The visible party lobby still uses NitroClash's official `/team` coordination service; actual matches, physics and reconnect reservations use only this server.
 
