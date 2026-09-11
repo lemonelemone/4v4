@@ -1,6 +1,8 @@
 # NitroClash hosted 4v4
 
-Current release version: **3.32.1**
+Current release version: **3.32.2**
+
+Version 3.32.2 fixes normal T/Enter chat after using Y team chat by returning NitroClash's shared chat input to its native enabled state. Team labels now use NitroClash's exact normal blue (`#132561`) and red (`#8f390d`) name colours while retaining **[Team]**. Native chat and join rows are merged through one ordered history sync, preventing rapid join packets from copying the same final row twice while preserving legitimate repeated messages. This userscript-only fix uses the existing v3.32.0 server protocol, so the server does not need restarting. The chat changes remain event-driven and do not add any per-frame work.
 
 Version 3.32.1 fixes the team-chat label staying in the normal T/Enter chat box after team chat had been opened. Y still shows **TEAM CHAT**, while normal chat restores its original blank label. This userscript-only fix uses the existing v3.32.0 server protocol, so the server does not need restarting.
 

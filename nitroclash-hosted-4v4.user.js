@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NitroClash — Hosted 4v4
 // @namespace    nc-local-4v4
-// @version      3.32.1
+// @version      3.32.2
 // @description  Adds normal hosted 4v4 and SUPER NC up to 5v5
 // @homepageURL  https://github.com/lemonelemone/4v4
 // @updateURL    https://raw.githubusercontent.com/lemonelemone/4v4/main/nitroclash-hosted-4v4.user.js
@@ -609,18 +609,24 @@
       if(chatAudience === "team") {
         const side=localPlayerTeam === 0 ? "Blue" : localPlayerTeam === 1 ? "Red" : "your team";
         status.textContent=`Team chat · ${side} only`;
-        status.style.color=localPlayerTeam === 1 ? "#ff3864" : "#35c7ef";
+        status.style.color=localPlayerTeam === 1 ? "#8f390d" : "#132561";
       }
     }
   }
   function closeMatchChat(){
     const input=document.getElementById("chat-input");
-    if(input){input.value="";input.blur();input.disabled=true;input.style.display="none";}
+    // NitroClash's native T/Enter chat reuses this same input. Leave it in the
+    // native enabled state after Y chat closes so the game can focus it again.
+    if(input){input.value="";input.blur();input.disabled=false;input.readOnly=false;input.style.display="";}
     setChatAudience("all",input);
   }
   let consumedChatKey = null;
   let chatRows = [];
   let chatFadeTimer = null;
+  let nativeChatSignatures = [];
+  let nativeChatSyncTimer = null;
+  let nativeChatPendingPackets = 0;
+  let nativeChatSynchronized = false;
   let sentChatText = "";
   let chatConfirmTimer = null;
   const setChatStatus = text => { const el = document.getElementById("nc-spectator-chat-status"); if (el) el.textContent = text; };
@@ -791,6 +797,53 @@
     if(chatRows.length>8)chatRows.shift();
     renderMatchChat();
   }
+  function resetNativeChatSync() {
+    clearTimeout(nativeChatSyncTimer);
+    nativeChatSyncTimer=null;
+    nativeChatSignatures=[];
+    nativeChatPendingPackets=0;
+    nativeChatSynchronized=false;
+  }
+  function chatRowSignature(row) {
+    return `${String(row.className || "")}\u0000${String(row.innerHTML || row.textContent || "")}`;
+  }
+  function chatHistoryOverlap(previous,current) {
+    for(let size=Math.min(previous.length,current.length);size>0;size--) {
+      let matches=true;
+      for(let index=0;index<size;index++)if(previous[previous.length-size+index]!==current[index]){matches=false;break;}
+      if(matches)return size;
+    }
+    return 0;
+  }
+  function scheduleNativeChatSync(isCurrentSocket) {
+    nativeChatPendingPackets++;
+    clearTimeout(nativeChatSyncTimer);
+    nativeChatSyncTimer=setTimeout(()=>{
+      nativeChatSyncTimer=null;
+      if(!isCurrentSocket())return;
+      const history=document.getElementById("chat-history");
+      if(!history)return;
+      const rows=[...(history.children || [])].filter(row=>
+        !row.classList.contains("nc-team-message") && !row.classList.contains("nc-spectator-message"));
+      const signatures=rows.map(chatRowSignature);
+      let addedRows;
+      if(!nativeChatSynchronized)addedRows=rows;
+      else {
+        const overlap=chatHistoryOverlap(nativeChatSignatures,signatures);
+        addedRows=rows.slice(overlap);
+        // A full eight-line native history can look unchanged when the same
+        // join/chat line repeats. The packet count preserves those real repeats.
+        if(addedRows.length<nativeChatPendingPackets)
+          addedRows=rows.slice(-Math.min(nativeChatPendingPackets,rows.length));
+      }
+      nativeChatSignatures=signatures;
+      nativeChatSynchronized=true;
+      nativeChatPendingPackets=0;
+      for(const row of addedRows)chatRows.push(row.cloneNode(true));
+      while(chatRows.length>8)chatRows.shift();
+      renderMatchChat();
+    },0);
+  }
   function refreshSpectatorChat() {
     const status=document.getElementById("nc-spectator-chat-status");
     if(status){
@@ -891,7 +944,7 @@
 
     const row = document.createElement("div"), label = document.createElement("strong"), body = document.createElement("span");
     row.className=teamMessage ? "nc-team-message" : "nc-spectator-message";
-    label.style.color = teamMessage ? (team === 1 ? "#ff3864" : "#35c7ef") : "#8b46bb";
+    label.style.color = teamMessage ? (team === 1 ? "#8f390d" : "#132561") : "#8b46bb";
     label.textContent = name + (teamMessage ? " [Team]: " : " [Spectator]: ");
     body.textContent = message;
     row.appendChild(label); row.appendChild(body); appendMatchChat(row);
@@ -1314,6 +1367,7 @@
           ArrayBuffer.isView(event.data) ? new Uint8Array(event.data.buffer,event.data.byteOffset,event.data.byteLength) : null;
         if(bytes?.[0]===7 && !relayStarted) {
           relayStarted=true;
+          resetNativeChatSync();
           localPlayerTeam=bytes[2] % 2;
           const name=String(route.name || document.getElementById("username")?.value || "Player").trim().slice(0,12) || "Player";
           const relayUrl=`${serverChoices[defaultServerCode].url}/?partyChat=1&party=${encodeURIComponent(route.partyCode)}&team=${localPlayerTeam}&name=${encodeURIComponent(name)}`;
@@ -1333,12 +1387,7 @@
           relay.addEventListener("close",()=>{if(teamChatSocket===relay)teamChatSocket=null;});
         }
         if(bytes?.[0]===13) {
-          const previousChat=document.getElementById("chat-history")?.innerHTML;
-          setTimeout(()=>{
-            if(officialPartyGameSocket!==socket || document.getElementById("chat-history")?.innerHTML===previousChat)return;
-            const row=document.getElementById("chat-history")?.lastElementChild;
-            if(row && !row.classList.contains("nc-team-message"))appendMatchChat(row);
-          });
+          scheduleNativeChatSync(()=>officialPartyGameSocket===socket);
         }
       } catch (_) {}
     });
@@ -1622,19 +1671,14 @@
             try { win.localStorage.removeItem(reconnectStorageName); } catch (_) {}
           }
           if(bytes?.[0]===13 && spectatorChatSocket===socket) {
-            const previousChat=document.getElementById("chat-history")?.innerHTML;
-            setTimeout(()=>{
-              if(spectatorChatSocket!==socket || document.getElementById("chat-history")?.innerHTML===previousChat)return;
-              const row=document.getElementById("chat-history")?.lastElementChild;
-              if(row && !row.classList.contains("nc-spectator-message"))appendMatchChat(row);
-            });
+            scheduleNativeChatSync(()=>spectatorChatSocket===socket);
           }
           if(bytes?.[0]===7) {
             if(spectatorSocket)nativeSend.call(socket,new Uint8Array([28,0]));
             observerSlot=bytes[2];
             if(!spectatorSocket)localPlayerTeam=bytes[2] % 2;
             if (ordinarySpectatorWatching && bytes[1] === 1) spectatorFocusSlot = bytes[2];
-            chatRows=[];clearTimeout(chatFadeTimer);
+            chatRows=[];clearTimeout(chatFadeTimer);resetNativeChatSync();
             installObserverSensors();
             const capture={index:0,observer:inGameSpectatorSocket};controlBodyCapture=capture;
             setTimeout(()=>{if(controlBodyCapture===capture)controlBodyCapture=null;},0);
@@ -2289,7 +2333,7 @@
     if (document.getElementById("nc-local-4v4-badge")) return true;
     const badge = document.createElement("div");
     badge.id = "nc-local-4v4-badge";
-    badge.textContent = "HOSTED 4v4 v3.32.1";
+    badge.textContent = "HOSTED 4v4 v3.32.2";
     Object.assign(badge.style, {
       position: "fixed", top: "8px", right: "8px", zIndex: 999999,
       padding: "5px 9px", color: "#fff", background: "#7c2d12",
